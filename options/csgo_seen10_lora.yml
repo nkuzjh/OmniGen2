@@ -1,0 +1,97 @@
+name: csgo_seen10_omnigen2_lora
+
+seed: 0
+device_specific_seed: true
+workder_specific_seed: true
+
+data:
+  dataset_type: csgo_seen10
+  data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
+  train_split: seen_train
+  validation_split: seen_validation
+  image_size: 448
+  use_chat_template: true
+  maximum_text_tokens: 256
+  prompt_dropout_prob: !!float 0.0001
+  ref_img_dropout_prob: !!float 0.0
+  max_output_pixels: 200704  # 448 * 448
+  max_input_pixels: 200704
+  max_side_length: 448
+
+model:
+  pretrained_vae_model_name_or_path: black-forest-labs/FLUX.1-dev
+  pretrained_text_encoder_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+  pretrained_model_path: OmniGen2/OmniGen2
+  pose_conditioning: true
+  pose_input_dim: 5
+  pose_hidden_dim: 512
+
+  arch_opt:
+    patch_size: 2
+    in_channels: 16
+    hidden_size: 2520
+    num_layers: 32
+    num_refiner_layers: 2
+    num_attention_heads: 21
+    num_kv_heads: 7
+    multiple_of: 256
+    norm_eps: !!float 1e-05
+    axes_dim_rope: [40, 40, 40]
+    axes_lens: [10000, 10000, 10000]
+    text_feat_dim: 2048
+    timestep_scale: !!float 1000
+    pose_conditioning: true
+    pose_input_dim: 5
+    pose_hidden_dim: 512
+
+transport:
+  snr_type: lognorm
+  do_shift: true
+  dynamic_time_shift: true
+
+train:
+  global_batch_size: 1
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_train_steps: 4000
+  dataloader_num_workers: 6
+
+  learning_rate: !!float 8e-7
+  pose_learning_rate: !!float 1e-4
+  scale_lr: false
+  lr_scheduler: timm_constant_with_warmup
+  warmup_t: 100
+  warmup_lr_init: 1e-18
+  warmup_prefix: true
+  t_in_epochs: false
+
+  use_8bit_adam: false
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: !!float 0.01
+  adam_epsilon: !!float 1e-08
+  max_grad_norm: 1
+  gradient_checkpointing: true
+  set_grads_to_none: true
+  allow_tf32: true
+  mixed_precision: bf16
+  ema_decay: 0.0
+
+  lora_ft: true
+  lora_rank: 8
+  lora_dropout: 0
+
+val:
+  # Both intervals must remain max_train_steps / 5.
+  validation_steps: 800
+  max_validation_batches: null
+  train_visualization_steps: 800
+  num_train_visualization_samples: 1
+
+logger:
+  log_with: [tensorboard]
+  checkpointing_steps: 800
+  checkpoints_total_limit: null
+
+cache_dir: null
+resume_from_checkpoint: null

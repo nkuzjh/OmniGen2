@@ -63,6 +63,40 @@ from ...cache_functions import cache_init
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+
+def prepare_pose_values(
+    pose_values: Optional[torch.Tensor],
+    batch_size: int,
+    num_images_per_prompt: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    pose_conditioning_enabled: bool,
+) -> Optional[torch.Tensor]:
+    """Validate and expand one normalized [x, y, z, pitch, yaw] row per prompt."""
+    if num_images_per_prompt <= 0:
+        raise ValueError("num_images_per_prompt must be a positive integer")
+    if pose_values is None:
+        if pose_conditioning_enabled:
+            raise ValueError("pose_values are required when pose_conditioning=True")
+        return None
+    if not pose_conditioning_enabled:
+        raise ValueError("pose_values were supplied to a transformer without pose conditioning")
+    if not torch.is_tensor(pose_values):
+        raise TypeError("pose_values must be a torch.Tensor with shape [B, 5]")
+    if pose_values.ndim != 2 or tuple(pose_values.shape) != (batch_size, 5):
+        raise ValueError(
+            f"pose_values must have shape [{batch_size}, 5], got {tuple(pose_values.shape)}"
+        )
+    if not pose_values.is_floating_point():
+        raise TypeError("pose_values must use a floating-point dtype")
+    if not torch.isfinite(pose_values).all().item():
+        raise ValueError("pose_values must contain only finite values")
+
+    return pose_values.to(device=device, dtype=dtype).repeat_interleave(
+        num_images_per_prompt, dim=0
+    )
+
+
 @dataclass
 class FMPipelineOutput(BaseOutput):
     """
@@ -493,6 +527,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         return_dict: bool = True,
         verbose: bool = False,
         step_func=None,
+        pose_values: Optional[torch.Tensor] = None,
     ):
 
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -530,6 +565,18 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
             prompt_attention_mask=prompt_attention_mask,
             negative_prompt_attention_mask=negative_prompt_attention_mask,
             max_sequence_length=max_sequence_length,
+        )
+
+        pose_conditioning_enabled = bool(
+            getattr(self.transformer.config, "pose_conditioning", False)
+        )
+        pose_values = prepare_pose_values(
+            pose_values=pose_values,
+            batch_size=batch_size,
+            num_images_per_prompt=num_images_per_prompt,
+            device=device,
+            dtype=prompt_embeds.dtype,
+            pose_conditioning_enabled=pose_conditioning_enabled,
         )
 
         dtype = self.vae.dtype
@@ -595,6 +642,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
             dtype=dtype,
             verbose=verbose,
             step_func=step_func,
+            pose_values=pose_values,
         )
 
         image = F.interpolate(image, size=(ori_height, ori_width), mode='bilinear')
@@ -623,7 +671,8 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         device,
         dtype,
         verbose,
-        step_func=None
+        step_func=None,
+        pose_values=None,
     ):
         batch_size = latents.shape[0]
 
@@ -665,6 +714,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                     freqs_cis=freqs_cis,
                     prompt_attention_mask=prompt_attention_mask,
                     ref_image_hidden_states=ref_latents,
+                    pose_values=pose_values,
                 )
                 text_guidance_scale = self.text_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
                 image_guidance_scale = self.image_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
@@ -684,6 +734,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         freqs_cis=freqs_cis,
                         prompt_attention_mask=negative_prompt_attention_mask,
                         ref_image_hidden_states=ref_latents,
+                        pose_values=pose_values,
                     )
 
                     if enable_taylorseer:
@@ -700,6 +751,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         freqs_cis=freqs_cis,
                         prompt_attention_mask=negative_prompt_attention_mask,
                         ref_image_hidden_states=None,
+                        pose_values=pose_values,
                     )
 
                     model_pred = model_pred_uncond + image_guidance_scale * (model_pred_ref - model_pred_uncond) + \
@@ -719,6 +771,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         freqs_cis=freqs_cis,
                         prompt_attention_mask=negative_prompt_attention_mask,
                         ref_image_hidden_states=None,
+                        pose_values=pose_values,
                     )
                     model_pred = model_pred_uncond + text_guidance_scale * (model_pred - model_pred_uncond)
 
@@ -753,15 +806,21 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         freqs_cis,
         prompt_attention_mask,
         ref_image_hidden_states,
+        pose_values=None,
     ):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
         batch_size, num_channels_latents, height, width = latents.shape
         
+        forward_parameters = set(inspect.signature(self.transformer.forward).parameters.keys())
         optional_kwargs = {}
-        if 'ref_image_hidden_states' in set(inspect.signature(self.transformer.forward).parameters.keys()):
+        if 'ref_image_hidden_states' in forward_parameters:
             optional_kwargs['ref_image_hidden_states'] = ref_image_hidden_states
+        if pose_values is not None:
+            if 'pose_values' not in forward_parameters:
+                raise ValueError("the loaded transformer does not support pose_values")
+            optional_kwargs['pose_values'] = pose_values
         
         model_pred = self.transformer(
             latents,

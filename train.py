@@ -7,8 +7,12 @@ from copy import deepcopy
 import argparse
 import logging
 import math
+import json
 import os
+import re
 import shutil
+import inspect
+import uuid
 from functools import partial
 from pathlib import Path
 from omegaconf import OmegaConf
@@ -88,7 +92,10 @@ def parse_args(root_path) -> OmegaConf:
         conf.train.global_batch_size = args.global_batch_size
     
     if args.data_path is not None:
-        conf.data.data_path = args.data_path
+        if conf.data.get("dataset_type") == "csgo_seen10":
+            conf.data.data_root = args.data_path
+        else:
+            conf.data.data_path = args.data_path
     return conf
 
 def setup_logging(args: OmegaConf, accelerator: Accelerator) -> None:
@@ -161,9 +168,554 @@ def log_time_distribution(transport, device, args):
     plt.savefig(save_path)
     plt.close()
     logger.info(f"Time step distribution plot saved to {save_path}")
+
+
+_CHECKPOINT_PATTERN = re.compile(r"^checkpoint-(\d+)$")
+
+
+def _checkpoint_directories(output_dir):
+    """Return real checkpoint directories as (step, basename), excluding links."""
+    checkpoints = []
+    if not os.path.isdir(output_dir):
+        return checkpoints
+    with os.scandir(output_dir) as entries:
+        for entry in entries:
+            match = _CHECKPOINT_PATTERN.fullmatch(entry.name)
+            if match is None or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            checkpoints.append((int(match.group(1)), entry.name))
+    return sorted(checkpoints)
+
+
+def _checkpoint_link_target(output_dir, link_name):
+    """Return a valid real checkpoint target for a checkpoint pointer symlink."""
+    link_path = os.path.join(output_dir, link_name)
+    if not os.path.islink(link_path):
+        return None
+    target_path = os.path.realpath(link_path)
+    target_name = os.path.basename(target_path)
+    match = _CHECKPOINT_PATTERN.fullmatch(target_name)
+    if (
+        match is None
+        or os.path.dirname(target_path) != os.path.realpath(output_dir)
+        or not os.path.isdir(target_path)
+        or os.path.islink(target_path)
+    ):
+        return None
+    return target_name
+
+
+def _atomic_update_checkpoint_link(output_dir, link_name, checkpoint_name):
+    """Atomically point a relative symlink at a saved checkpoint directory."""
+    if link_name not in {"latest", "late", "best"}:
+        raise ValueError(f"Unsupported checkpoint link name: {link_name}")
+    checkpoint_path = os.path.join(output_dir, checkpoint_name)
+    match = _CHECKPOINT_PATTERN.fullmatch(checkpoint_name)
+    if match is None or not os.path.isdir(checkpoint_path) or os.path.islink(checkpoint_path):
+        raise FileNotFoundError(f"Not a saved checkpoint directory: {checkpoint_path}")
+
+    link_path = os.path.join(output_dir, link_name)
+    if os.path.lexists(link_path) and not os.path.islink(link_path):
+        raise FileExistsError(f"Refusing to replace non-symlink checkpoint pointer: {link_path}")
+
+    temporary_link = os.path.join(
+        output_dir, f".{link_name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    try:
+        os.symlink(checkpoint_name, temporary_link)
+        os.replace(temporary_link, link_path)
+    finally:
+        if os.path.lexists(temporary_link):
+            os.unlink(temporary_link)
+
+
+def _prune_old_checkpoints(output_dir, total_limit):
+    """Apply the configured limit without deleting latest/best or symlink entries."""
+    if total_limit is None:
+        return
+    total_limit = int(total_limit)
+    if total_limit <= 0:
+        raise ValueError("logger.checkpoints_total_limit must be positive or null")
+
+    checkpoints = _checkpoint_directories(output_dir)
+    protected = {
+        target
+        for target in (
+            _checkpoint_link_target(output_dir, "latest"),
+            _checkpoint_link_target(output_dir, "late"),
+            _checkpoint_link_target(output_dir, "best"),
+        )
+        if target is not None
+    }
+    while len(checkpoints) >= total_limit:
+        removable = next((item for item in checkpoints if item[1] not in protected), None)
+        if removable is None:
+            logger.info("Keeping protected latest/best checkpoint despite checkpoint limit")
+            break
+        _, name = removable
+        shutil.rmtree(os.path.join(output_dir, name))
+        checkpoints.remove(removable)
+
+
+def _resolve_resume_checkpoint(output_dir, requested):
+    """Resolve latest or an explicit checkpoint path and parse its step safely."""
+    if requested == "latest":
+        checkpoint_name = _checkpoint_link_target(output_dir, "latest")
+        if checkpoint_name is None:
+            checkpoints = _checkpoint_directories(output_dir)
+            checkpoint_name = checkpoints[-1][1] if checkpoints else None
+        if checkpoint_name is None:
+            return None, None
+        checkpoint_path = os.path.join(output_dir, checkpoint_name)
+    else:
+        requested_path = Path(os.path.expanduser(str(requested)))
+        if requested_path.is_absolute():
+            checkpoint_path = requested_path
+        elif os.path.lexists(os.path.join(output_dir, str(requested))):
+            checkpoint_path = Path(output_dir) / str(requested)
+        else:
+            checkpoint_path = requested_path
+        if not checkpoint_path.is_dir():
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {checkpoint_path}")
+        checkpoint_path = checkpoint_path.resolve()
+
+    checkpoint_name = os.path.basename(os.path.realpath(checkpoint_path))
+    match = _CHECKPOINT_PATTERN.fullmatch(checkpoint_name)
+    if match is None:
+        raise ValueError(
+            "Resume checkpoint directory must be named checkpoint-<step>, got "
+            f"{checkpoint_name!r}"
+        )
+    return os.path.realpath(checkpoint_path), int(match.group(1))
+
+
+def _pose_dimensions(args):
+    arch_opt = args.model.get("arch_opt", {})
+    input_dim = int(args.model.get("pose_input_dim", arch_opt.get("pose_input_dim", 5)))
+    hidden_dim = int(args.model.get("pose_hidden_dim", arch_opt.get("pose_hidden_dim", 512)))
+    if input_dim != 5:
+        raise ValueError(f"Seen-10 pose input must have 5 normalized values, got {input_dim}")
+    if hidden_dim <= 0:
+        raise ValueError("model.pose_hidden_dim must be positive")
+    return input_dim, hidden_dim
+
+
+def _load_transformer(args, seen10):
+    if not seen10:
+        return OmniGen2Transformer2DModel.from_pretrained(
+            args.model.pretrained_model_path, subfolder="transformer"
+        )
+
+    input_dim, hidden_dim = _pose_dimensions(args)
+    init_parameters = inspect.signature(OmniGen2Transformer2DModel.__init__).parameters
+    pose_kwargs = {}
+    if "pose_conditioning" in init_parameters:
+        pose_kwargs["pose_conditioning"] = True
+    elif "pose_conditioning" not in init_parameters:
+        raise TypeError("The transformer constructor does not support pose_conditioning")
+
+    input_key = next(
+        (key for key in ("pose_input_dim", "pose_conditioning_input_dim") if key in init_parameters),
+        None,
+    )
+    if input_key is not None:
+        pose_kwargs[input_key] = input_dim
+    elif getattr(OmniGen2Transformer2DModel, "pose_input_dim", 5) != input_dim:
+        raise TypeError("The transformer pose input dimension does not match the Seen-10 schema")
+
+    hidden_key = next(
+        (
+            key
+            for key in ("pose_hidden_dim", "pose_conditioning_hidden_dim")
+            if key in init_parameters
+        ),
+        None,
+    )
+    if hidden_key is None:
+        raise TypeError("The transformer constructor does not expose a pose hidden dimension")
+    pose_kwargs[hidden_key] = hidden_dim
+
+    model = OmniGen2Transformer2DModel.from_pretrained(
+        args.model.pretrained_model_path,
+        subfolder="transformer",
+        **pose_kwargs,
+    )
+    pose_module = _get_pose_module(model)
+    if pose_module is None:
+        enable_pose = getattr(model, "enable_pose_conditioning", None)
+        if enable_pose is None:
+            raise TypeError("The loaded transformer has no trainable pose conditioner")
+        enable_pose(hidden_dim)
+    return model
+
+
+def _get_pose_module(model):
+    pose_module = getattr(model, "pose_conditioner", None)
+    if pose_module is None:
+        pose_module = getattr(model, "pose_adapter", None)
+    return pose_module
+
+
+def _make_trainable_parameter_groups(model, args, seen10):
+    pose_module = _get_pose_module(model)
+    pose_parameters = list(pose_module.parameters()) if pose_module is not None else []
+    if seen10 and not pose_parameters:
+        raise ValueError("Seen-10 training requires a trainable pose conditioner")
+    if seen10:
+        if not args.train.get("lora_ft", False):
+            raise ValueError("Seen-10 configuration must enable train.lora_ft")
+        for parameter in pose_parameters:
+            parameter.requires_grad_(True)
+
+    pose_ids = {id(parameter) for parameter in pose_parameters}
+    lora_parameters = []
+    trainable_parameters = []
+    seen_parameter_ids = set()
+    unexpected = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad or id(parameter) in seen_parameter_ids:
+            continue
+        seen_parameter_ids.add(id(parameter))
+        trainable_parameters.append(parameter)
+        if id(parameter) in pose_ids:
+            continue
+        lora_parameters.append(parameter)
+        if seen10 and "lora_" not in name:
+            unexpected.append(name)
+
+    if seen10 and unexpected:
+        raise RuntimeError(
+            "Seen-10 LoRA training found non-LoRA trainable parameters outside the pose MLP: "
+            + ", ".join(unexpected[:8])
+        )
+    if not trainable_parameters:
+        raise ValueError("No trainable transformer parameters were found")
+
+    if not seen10:
+        return trainable_parameters, [{"params": trainable_parameters, "lr": args.train.learning_rate}]
+
+    if not lora_parameters:
+        raise ValueError("Seen-10 LoRA training found no trainable LoRA parameters")
+    pose_learning_rate = args.train.get("pose_learning_rate", None)
+    if pose_learning_rate is None or float(pose_learning_rate) <= 0:
+        raise ValueError("Seen-10 configuration requires a positive train.pose_learning_rate")
+    parameter_groups = [
+        {"params": lora_parameters, "lr": float(args.train.learning_rate)},
+        {"params": pose_parameters, "lr": float(pose_learning_rate)},
+    ]
+    if len({id(parameter) for group in parameter_groups for parameter in group["params"]}) != len(
+        [parameter for group in parameter_groups for parameter in group["params"]]
+    ):
+        raise RuntimeError("Duplicate transformer parameter found in optimizer groups")
+    return trainable_parameters, parameter_groups
+
+
+def _call_with_supported_kwargs(constructor, kwargs):
+    parameters = inspect.signature(constructor).parameters
+    accepts_arbitrary = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    filtered = kwargs if accepts_arbitrary else {
+        key: value for key, value in kwargs.items() if key in parameters
+    }
+    return constructor(**filtered)
+
+
+def _make_csgo_seen10_dataset(args, tokenizer, split, load_target):
+    from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Dataset
+
+    train_split = args.data.get("train_split", "seen_train")
+    dataset_kwargs = {
+        "data_root": args.data.data_root,
+        "split": split,
+        "tokenizer": tokenizer,
+        "use_chat_template": args.data.get("use_chat_template", True),
+        "max_input_pixels": OmegaConf.to_object(args.data.get("max_input_pixels", 1024 * 1024)),
+        "max_output_pixels": args.data.get("max_output_pixels", 1024 * 1024),
+        "max_side_length": args.data.get("max_side_length", 2048),
+        "load_target": load_target,
+        "image_size": args.data.get("image_size", 448),
+        "prompt_dropout_prob": (
+            args.data.get("prompt_dropout_prob", 0.0) if split == train_split else 0.0
+        ),
+        "ref_img_dropout_prob": (
+            args.data.get("ref_img_dropout_prob", 0.0) if split == train_split else 0.0
+        ),
+    }
+    return _call_with_supported_kwargs(CSGOSeen10Dataset, dataset_kwargs)
+
+
+def _encode_vae_image(vae, image, weight_dtype, device):
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+    elif image.ndim != 4 or image.shape[0] != 1:
+        raise ValueError(
+            "Each OmniGen2 VAE input must have shape [3,H,W] or [1,3,H,W], "
+            f"got {tuple(image.shape)}"
+        )
+    image = image.to(device=device, dtype=vae.dtype)
+    latent = vae.encode(image).latent_dist.sample()
+    if vae.config.shift_factor is not None:
+        latent = latent - vae.config.shift_factor
+    if vae.config.scaling_factor is not None:
+        latent = latent * vae.config.scaling_factor
+    return latent.to(dtype=weight_dtype)
+
+
+def _prepare_diffusion_batch(
+    batch,
+    text_encoder,
+    vae,
+    weight_dtype,
+    device,
+    freqs_cis,
+    seen10,
+):
+    """Encode one collated batch for either the train or validation forward."""
+    input_images = batch["input_images"]
+    output_image = batch["output_image"]
+    text_input_ids = batch["text_ids"].to(device=device)
+    text_mask = batch["text_mask"].to(device=device)
+
+    with torch.no_grad():
+        text_feats = text_encoder(
+            input_ids=text_input_ids,
+            attention_mask=text_mask,
+            output_hidden_states=False,
+        ).last_hidden_state
+
+        input_latents = []
+        for references in input_images:
+            if references is not None and len(references) > 0:
+                input_latents.append(
+                    [
+                        _encode_vae_image(vae, image, weight_dtype, device).squeeze(0)
+                        for image in references
+                    ]
+                )
+            else:
+                input_latents.append(None)
+
+        output_latents = [
+            _encode_vae_image(vae, image, weight_dtype, device).squeeze(0)
+            for image in output_image
+        ]
+
+    model_kwargs = dict(
+        text_hidden_states=text_feats,
+        text_attention_mask=text_mask,
+        ref_image_hidden_states=input_latents,
+        freqs_cis=freqs_cis,
+    )
+    if seen10:
+        pose_values = batch.get("pose_values")
+        if pose_values is None:
+            raise KeyError("CSGOSeen10Collator must return pose_values")
+        if not torch.is_tensor(pose_values):
+            pose_values = torch.as_tensor(pose_values)
+        model_kwargs["pose_values"] = pose_values.to(device=device, dtype=torch.float32)
+
+    token_counts = torch.tensor(
+        [latent.numel() for latent in output_latents],
+        device=device,
+        dtype=torch.long,
+    )
+    return {
+        "input_images": input_images,
+        "output_image": output_image,
+        "text_input_ids": text_input_ids,
+        "output_latents": output_latents,
+        "model_kwargs": model_kwargs,
+        "token_counts": token_counts,
+    }
+
+
+def _diffusion_training_losses(transport, model, prepared_batch, accelerator):
+    return transport.training_losses(
+        model,
+        prepared_batch["output_latents"],
+        prepared_batch["model_kwargs"],
+        process_index=AcceleratorState().process_index,
+        num_processes=AcceleratorState().num_processes,
+        reduction="sum",
+    )
+
+
+def _evaluation_rng(accelerator, seed):
+    device = torch.device(accelerator.device)
+    devices = []
+    if device.type == "cuda":
+        devices = [device.index if device.index is not None else torch.cuda.current_device()]
+    return torch.random.fork_rng(devices=devices), seed + accelerator.process_index
+
+
+def _evaluate_seen_validation(
+    accelerator,
+    model,
+    validation_dataloader,
+    text_encoder,
+    vae,
+    weight_dtype,
+    freqs_cis,
+    transport,
+    max_validation_batches=None,
+    seed=0,
+):
+    """Compute validation diffusion loss, globally weighted by latent elements."""
+    was_training = model.training
+    model.eval()
+    total_loss = torch.zeros((), device=accelerator.device, dtype=torch.float64)
+    total_tokens = torch.zeros((), device=accelerator.device, dtype=torch.long)
+    rng_context, rank_seed = _evaluation_rng(accelerator, int(seed))
+
+    try:
+        with rng_context:
+            torch.random.default_generator.manual_seed(rank_seed)
+            if torch.device(accelerator.device).type == "cuda":
+                with torch.cuda.device(accelerator.device):
+                    torch.cuda.manual_seed(rank_seed)
+            with torch.no_grad():
+                for batch_index, batch in enumerate(validation_dataloader):
+                    if max_validation_batches is not None and batch_index >= int(max_validation_batches):
+                        break
+                    prepared = _prepare_diffusion_batch(
+                        batch,
+                        text_encoder,
+                        vae,
+                        weight_dtype,
+                        accelerator.device,
+                        freqs_cis,
+                        seen10=True,
+                    )
+                    loss_dict = _diffusion_training_losses(transport, model, prepared, accelerator)
+                    local_losses = loss_dict["loss"].detach().to(dtype=torch.float64)
+                    gathered_losses, gathered_tokens = accelerator.gather_for_metrics(
+                        (local_losses, prepared["token_counts"])
+                    )
+                    total_loss += gathered_losses.sum()
+                    total_tokens += gathered_tokens.sum()
+    finally:
+        model.train(was_training)
+
+    accelerator.wait_for_everyone()
+    if total_tokens.item() == 0:
+        raise ValueError("seen_validation produced no samples; cannot select a checkpoint")
+    return (total_loss / total_tokens).item()
+
+
+def _load_metric_history(metrics_path):
+    records = []
+    if not os.path.isfile(metrics_path):
+        return records
+    with open(metrics_path, "r", encoding="utf-8") as metrics_file:
+        for line in metrics_file:
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("Ignoring malformed train_metrics.jsonl line")
+    return records
+
+
+def _write_loss_curve(metrics_path, output_path):
+    records = _load_metric_history(metrics_path)
+    train_points = [
+        (int(item["step"]), float(item["loss"]))
+        for item in records
+        if item.get("step") is not None and item.get("loss") is not None
+    ]
+    validation_points = [
+        (int(item["step"]), float(item["val_loss"]))
+        for item in records
+        if item.get("step") is not None and item.get("val_loss") is not None
+    ]
+    if not train_points:
+        return
+    plt.figure(figsize=(10, 6))
+    plt.plot(
+        [point[0] for point in train_points],
+        [point[1] for point in train_points],
+        label="train loss",
+        linewidth=1.2,
+    )
+    if validation_points:
+        plt.plot(
+            [point[0] for point in validation_points],
+            [point[1] for point in validation_points],
+            marker="o",
+            label="seen_validation loss",
+        )
+    plt.xlabel("optimizer step")
+    plt.ylabel("diffusion loss")
+    plt.title("OmniGen2 Seen-10 training loss")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
+def _save_accelerate_checkpoint(accelerator, args, global_step, seen10):
+    if accelerator.is_main_process:
+        _prune_old_checkpoints(
+            args.output_dir,
+            args.logger.get("checkpoints_total_limit", None),
+        )
+    accelerator.wait_for_everyone()
+
+    checkpoint_name = f"checkpoint-{global_step}"
+    save_path = os.path.join(args.output_dir, checkpoint_name)
+    if os.path.lexists(save_path):
+        raise FileExistsError(
+            f"Refusing to overwrite existing checkpoint: {save_path}"
+        )
+    accelerator.save_state(save_path)
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process and seen10:
+        _atomic_update_checkpoint_link(args.output_dir, "latest", checkpoint_name)
+        # The benchmark contract names the final-checkpoint pointer ``late``.
+        # Keep ``latest`` as the native resume alias and expose both atomically.
+        _atomic_update_checkpoint_link(args.output_dir, "late", checkpoint_name)
+    accelerator.wait_for_everyone()
+    logger.info(f"Saved state to {save_path}")
     
     
 def main(args):
+    seen10 = args.data.get("dataset_type", None) == "csgo_seen10"
+    if seen10:
+        if "max_train_steps" not in args.train:
+            raise ValueError("Seen-10 training requires train.max_train_steps")
+        max_train_steps = int(args.train.max_train_steps)
+        if max_train_steps < 5 or max_train_steps % 5:
+            raise ValueError("Seen-10 train.max_train_steps must be >= 5 and divisible by 5")
+        expected_interval = max_train_steps // 5
+        if int(args.val.get("validation_steps", -1)) != expected_interval:
+            raise ValueError(
+                "Seen-10 val.validation_steps must equal train.max_train_steps / 5 "
+                f"({expected_interval})"
+            )
+        if int(args.logger.checkpointing_steps) != expected_interval:
+            raise ValueError(
+                "Seen-10 logger.checkpointing_steps must equal train.max_train_steps / 5 "
+                f"({expected_interval})"
+            )
+        max_validation_batches = args.val.get("max_validation_batches", None)
+        if max_validation_batches is not None and int(max_validation_batches) <= 0:
+            raise ValueError("val.max_validation_batches must be positive or null")
+        metrics_path = os.path.join(args.output_dir, "logs", "train_metrics.jsonl")
+        if not args.resume_from_checkpoint and (
+            _checkpoint_directories(args.output_dir)
+            or os.path.isfile(metrics_path)
+            or os.path.lexists(os.path.join(args.output_dir, "latest"))
+        ):
+            raise FileExistsError(
+                "Seen-10 output already contains a checkpoint or training metrics; "
+                "resume explicitly instead of overwriting it"
+            )
+
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=Path(args.output_dir, 'logs'))
 
     accelerator = Accelerator(
@@ -198,9 +750,7 @@ def main(args):
     
     ema_decay = args.train.get('ema_decay', 0)
 
-    model = OmniGen2Transformer2DModel.from_pretrained(
-        args.model.pretrained_model_path, subfolder="transformer"
-    )
+    model = _load_transformer(args, seen10)
     model.train()
 
     # model = OmniGen2Transformer2DModel(**args.model.arch_opt)
@@ -295,10 +845,12 @@ def main(args):
     log_model_info("transformer", model)
 
     # Optimizer creation
-    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+    trainable_params, optimizer_param_groups = _make_trainable_parameter_groups(
+        model, args, seen10
+    )
     
     optimizer = optimizer_class(
-        trainable_params,
+        optimizer_param_groups,
         lr=args.train.learning_rate,
         betas=(args.train.adam_beta1, args.train.adam_beta2),
         weight_decay=args.train.adam_weight_decay,
@@ -308,16 +860,41 @@ def main(args):
     logger.info("***** Prepare dataset *****")
 
     with accelerator.main_process_first():
-        train_dataset = OmniGen2TrainDataset(
-            args.data.data_path,
-            tokenizer=text_tokenizer,
-            use_chat_template=args.data.use_chat_template,
-            prompt_dropout_prob=args.data.get('prompt_dropout_prob', 0.0),
-            ref_img_dropout_prob=args.data.get('ref_img_dropout_prob', 0.0),
-            max_input_pixels=OmegaConf.to_object(args.data.get('max_input_pixels', 1024 * 1024)),
-            max_output_pixels=args.data.get('max_output_pixels', 1024 * 1024),
-            max_side_length=args.data.get('max_side_length', 2048),
-        )
+        if seen10:
+            from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Collator
+
+            train_dataset = _make_csgo_seen10_dataset(
+                args,
+                text_tokenizer,
+                split=args.data.get("train_split", "seen_train"),
+                load_target=True,
+            )
+            validation_dataset = _make_csgo_seen10_dataset(
+                args,
+                text_tokenizer,
+                split=args.data.get("validation_split", "seen_validation"),
+                load_target=True,
+            )
+            collate_fn = CSGOSeen10Collator(
+                tokenizer=text_tokenizer,
+                max_token_len=args.data.maximum_text_tokens,
+            )
+        else:
+            train_dataset = OmniGen2TrainDataset(
+                args.data.data_path,
+                tokenizer=text_tokenizer,
+                use_chat_template=args.data.use_chat_template,
+                prompt_dropout_prob=args.data.get('prompt_dropout_prob', 0.0),
+                ref_img_dropout_prob=args.data.get('ref_img_dropout_prob', 0.0),
+                max_input_pixels=OmegaConf.to_object(args.data.get('max_input_pixels', 1024 * 1024)),
+                max_output_pixels=args.data.get('max_output_pixels', 1024 * 1024),
+                max_side_length=args.data.get('max_side_length', 2048),
+            )
+            validation_dataset = None
+            collate_fn = OmniGen2Collator(
+                tokenizer=text_tokenizer,
+                max_token_len=args.data.maximum_text_tokens,
+            )
 
     # default: 1000 steps, linear noise schedule
     transport = create_transport(
@@ -338,6 +915,10 @@ def main(args):
         log_time_distribution(transport, accelerator.device, args)
 
     logger.info(f"Number of training samples: {len(train_dataset)}")
+    if seen10:
+        logger.info(f"Number of seen_validation samples: {len(validation_dataset)}")
+        if len(train_dataset) == 0 or len(validation_dataset) == 0:
+            raise ValueError("Seen-10 train and validation datasets must both be non-empty")
 
     if args.seed is not None and args.get("workder_specific_seed", False):
         from omnigen2.utils.reproducibility import worker_init_fn
@@ -361,8 +942,19 @@ def main(args):
         num_workers=args.train.dataloader_num_workers,
         worker_init_fn=worker_init_fn,
         drop_last=True,
-        collate_fn=OmniGen2Collator(tokenizer=text_tokenizer, max_token_len=args.data.maximum_text_tokens)
+        collate_fn=collate_fn,
     )
+    validation_dataloader = None
+    if seen10:
+        validation_dataloader = torch.utils.data.DataLoader(
+            validation_dataset,
+            shuffle=False,
+            batch_size=args.train.batch_size,
+            num_workers=args.train.dataloader_num_workers,
+            worker_init_fn=worker_init_fn,
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
 
     logger.info(f"{args.train.batch_size=} {args.train.gradient_accumulation_steps=} {accelerator.num_processes=} {args.train.global_batch_size=}")
     assert (
@@ -416,11 +1008,20 @@ def main(args):
 
     logger.info("***** Prepare everything with our accelerator *****")
 
-    if args.train.ema_decay != 0:
+    if args.train.ema_decay != 0 and seen10:
+        model, model_ema, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
+            model, model_ema, optimizer, train_dataloader, validation_dataloader, lr_scheduler
+        )
+        model_ema = EMAModel(model_ema.parameters(), decay=ema_decay, model_cls=type(unwrap_model(model)), model_config=model_ema.config)
+    elif args.train.ema_decay != 0:
         model, model_ema, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             model, model_ema, optimizer, train_dataloader, lr_scheduler
         )
         model_ema = EMAModel(model_ema.parameters(), decay=ema_decay, model_cls=type(unwrap_model(model)), model_config=model_ema.config)
+    elif seen10:
+        model, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, validation_dataloader, lr_scheduler
+        )
     else:
         model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dataloader, lr_scheduler
@@ -451,31 +1052,37 @@ def main(args):
     logger.info(f"  Total optimization steps = {args.train.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    resume_batches_to_skip = 0
+
+    metrics_path = os.path.join(args.output_dir, "logs", "train_metrics.jsonl")
+    metrics_history = _load_metric_history(metrics_path) if seen10 else []
+    validation_history = [
+        float(item["val_loss"])
+        for item in metrics_history
+        if item.get("val_loss") is not None
+    ]
+    best_validation_loss = min(validation_history) if validation_history else float("inf")
         
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
-
-        if path is None:
+        resume_path, resume_step = _resolve_resume_checkpoint(
+            args.output_dir, args.resume_from_checkpoint
+        )
+        if resume_path is None:
             accelerator.print(
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
-
+            accelerator.print(f"Resuming from checkpoint {resume_path}")
+            accelerator.load_state(resume_path)
+            global_step = resume_step
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
+            resume_batches_to_skip = (
+                global_step % num_update_steps_per_epoch
+            ) * args.train.gradient_accumulation_steps
     else:
         initial_global_step = 0
 
@@ -496,7 +1103,13 @@ def main(args):
     for epoch in range(first_epoch, args.train.num_train_epochs):
         if 'max_train_steps' in args.train and global_step >= args.train.max_train_steps:
             break
-        for step, batch in enumerate(train_dataloader):
+        epoch_dataloader = train_dataloader
+        if epoch == first_epoch and resume_batches_to_skip > 0:
+            epoch_dataloader = accelerator.skip_first_batches(
+                train_dataloader, resume_batches_to_skip
+            )
+        resume_batches_to_skip = 0
+        for step, batch in enumerate(epoch_dataloader):
             # Number of bins, for loss recording
             n_loss_bins = 10
             # Create bins for t
@@ -505,62 +1118,26 @@ def main(args):
             bin_occurrence = torch.zeros(n_loss_bins, device=accelerator.device)
             bin_sum_loss = torch.zeros(n_loss_bins, device=accelerator.device)
 
-            input_images = batch['input_images']
-            output_image = batch['output_image']
-            text_mask = batch['text_mask']
-            text_input_ids = batch['text_ids']
+            prepared_batch = _prepare_diffusion_batch(
+                batch,
+                text_encoder,
+                vae,
+                weight_dtype,
+                accelerator.device,
+                freqs_cis,
+                seen10=seen10,
+            )
+            input_images = prepared_batch['input_images']
+            output_image = prepared_batch['output_image']
+            text_input_ids = prepared_batch['text_input_ids']
+            output_latents = prepared_batch['output_latents']
 
             with accelerator.accumulate(model):
-                with torch.no_grad():
-                    text_feats = text_encoder(
-                        input_ids=text_input_ids,
-                        attention_mask=text_mask,
-                        output_hidden_states=False,
-                    ).last_hidden_state
-
-                @torch.no_grad()
-                def encode_vae(img):
-                    z0 = vae.encode(img.to(dtype=vae.dtype)).latent_dist.sample()
-                    if vae.config.shift_factor is not None:
-                        z0 = z0 - vae.config.shift_factor
-                    if vae.config.scaling_factor is not None:
-                        z0 = z0 * vae.config.scaling_factor
-                    z0 = z0.to(dtype=weight_dtype)
-                    return z0
+                local_num_tokens_in_batch = prepared_batch["token_counts"].sum()
                 
-                input_latents = []
-                for i, img in enumerate(input_images):
-                    if img is not None and len(img) > 0:
-                        input_latents.append([])
-                        for j, img_j in enumerate(img):
-                            input_latents[i].append(encode_vae(img_j).squeeze(0))
-                    else:
-                        input_latents.append(None)
-                
-                output_latents = []
-                for i, img in enumerate(output_image):
-                    output_latents.append(encode_vae(img).squeeze(0))
-
-                model_kwargs = dict(
-                    text_hidden_states=text_feats,
-                    text_attention_mask=text_mask,
-                    ref_image_hidden_states=input_latents,
-                    freqs_cis=freqs_cis,
-                )
-
-                local_num_tokens_in_batch = 0
-
-                for i, latent in enumerate(output_latents):
-                    local_num_tokens_in_batch += latent.numel()
-                
-                num_tokens_in_batch = accelerator.gather(torch.tensor(local_num_tokens_in_batch, device=accelerator.device)).sum().item()
-                loss_dict = transport.training_losses(
-                    model,
-                    output_latents,
-                    model_kwargs,
-                    process_index=AcceleratorState().process_index,
-                    num_processes=AcceleratorState().num_processes,
-                    reduction='sum'
+                num_tokens_in_batch = accelerator.gather(local_num_tokens_in_batch).sum().item()
+                loss_dict = _diffusion_training_losses(
+                    transport, model, prepared_batch, accelerator
                 )
                 loss = loss_dict["loss"].sum()
                 loss = (loss * accelerator.gradient_state.num_steps * accelerator.num_processes) / num_tokens_in_batch
@@ -568,13 +1145,11 @@ def main(args):
 
                 accelerator.backward(total_loss)
 
-                bin_indices = torch.bucketize(loss_dict["t"].cuda(), loss_bins, right=True) - 1
+                bin_indices = torch.bucketize(
+                    loss_dict["t"].to(device=loss_bins.device), loss_bins, right=True
+                ) - 1
                 detached_loss = loss_dict["loss"].detach()
-                
-                local_num_tokens = []
-                for i, latent in enumerate(output_latents):
-                    local_num_tokens.append(latent.numel())
-                local_num_tokens = torch.tensor(local_num_tokens, device=accelerator.device)
+                local_num_tokens = prepared_batch["token_counts"]
 
                 # Iterate through each bin index to update occurrence and sum
                 for i in range(n_loss_bins):
@@ -612,32 +1187,62 @@ def main(args):
                     model_ema.step(model.parameters())
                     
                 global_step += 1
+                validation_loss = None
 
                 if global_step % args.logger.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        if args.logger.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-                            
-                            if len(checkpoints) >= args.logger.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.logger.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                    _save_accelerate_checkpoint(
+                        accelerator, args, global_step, seen10=seen10
+                    )
+                    if seen10:
+                        validation_loss = _evaluate_seen_validation(
+                            accelerator,
+                            model,
+                            validation_dataloader,
+                            text_encoder,
+                            vae,
+                            weight_dtype,
+                            freqs_cis,
+                            transport,
+                            max_validation_batches=args.val.get(
+                                "max_validation_batches", None
+                            ),
+                            seed=args.get("seed", 0),
+                        )
+                        if not math.isfinite(validation_loss):
+                            raise FloatingPointError(
+                                f"seen_validation loss is not finite at step {global_step}: "
+                                f"{validation_loss}"
+                            )
+                        if accelerator.is_main_process:
+                            if validation_loss < best_validation_loss:
+                                checkpoint_name = f"checkpoint-{global_step}"
+                                _atomic_update_checkpoint_link(
+                                    args.output_dir, "best", checkpoint_name
                                 )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                                best_validation_loss = validation_loss
+                                logger.info(
+                                    "New best seen_validation loss %.8f at step %d",
+                                    validation_loss,
+                                    global_step,
+                                )
+                        accelerator.wait_for_everyone()
 
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-                                        
-                    accelerator.wait_for_everyone()
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    accelerator.save_state(save_path)
-                    logger.info(f"Saved state to {save_path}")
-                    
+                if seen10:
+                    metric_record = {
+                        "step": int(global_step),
+                        "loss": float(logs["loss"]),
+                        "lr": float(logs["lr"]),
+                        "val_loss": (
+                            float(validation_loss) if validation_loss is not None else None
+                        ),
+                    }
+                    if accelerator.is_main_process:
+                        with open(metrics_path, "a", encoding="utf-8") as metrics_file:
+                            metrics_file.write(
+                                json.dumps(metric_record, allow_nan=False) + "\n"
+                            )
+                            metrics_file.flush()
+
                 if accelerator.is_main_process:
                     if 'train_visualization_steps' in args.val and (global_step - 1) % args.val.train_visualization_steps == 0:
                         num_samples = min(args.val.get('num_train_visualization_samples', 3), args.train.batch_size)
@@ -674,7 +1279,7 @@ def main(args):
                                 
                                 to_pil_image(canvas).save(os.path.join(args.output_dir, f"input_visualization_{global_step}_{i}_t{loss_dict['t'][i]}.png"))
                                 
-                                input_ids = text_input_ids[i]
+                                input_ids = text_input_ids[i].detach().cpu()
                                 instruction = text_tokenizer.decode(input_ids, skip_special_tokens=False)
 
                                 with open(os.path.join(args.output_dir, f"instruction_{global_step}_{i}.txt"), "w", encoding='utf-8') as f:
@@ -688,29 +1293,30 @@ def main(args):
             if 'max_train_steps' in args.train and global_step >= args.train.max_train_steps:
                 break
 
-    checkpoints = os.listdir(args.output_dir)
-    checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-    if len(checkpoints) > 0 and int(checkpoints[-1].split("-")[1]) < global_step:
-        if accelerator.is_main_process:
-            if args.logger.checkpoints_total_limit is not None:
-                if len(checkpoints) >= args.logger.checkpoints_total_limit:
-                    num_to_remove = len(checkpoints) - args.logger.checkpoints_total_limit + 1
-                    removing_checkpoints = checkpoints[0:num_to_remove]
+    checkpoints = _checkpoint_directories(args.output_dir)
+    if global_step > 0 and (
+        not checkpoints or checkpoints[-1][0] < global_step
+    ):
+        _save_accelerate_checkpoint(
+            accelerator, args, global_step, seen10=seen10
+        )
 
-                    logger.info(
-                        f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                    )
-                    logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                    for removing_checkpoint in removing_checkpoints:
-                        removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                        shutil.rmtree(removing_checkpoint)
-
+    if seen10:
         accelerator.wait_for_everyone()
-        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-        accelerator.save_state(save_path)
-        logger.info(f"Saved state to {save_path}")
+        checkpoints = _checkpoint_directories(args.output_dir)
+        if checkpoints and accelerator.is_main_process:
+            _atomic_update_checkpoint_link(
+                args.output_dir, "latest", checkpoints[-1][1]
+            )
+            _atomic_update_checkpoint_link(
+                args.output_dir, "late", checkpoints[-1][1]
+            )
+        if accelerator.is_main_process:
+            _write_loss_curve(
+                metrics_path,
+                os.path.join(args.output_dir, "loss_curve.png"),
+            )
+        accelerator.wait_for_everyone()
 
     accelerator.end_training()
 

@@ -233,3 +233,6 @@ outputs_gradio/*
 test.py
 data_configs/test
 scripts/test
+pretrained_models/*
+!pretrained_models/.gitkeep
+outputs/

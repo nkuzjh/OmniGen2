@@ -219,6 +219,35 @@ class OmniGen2TransformerBlock(nn.Module):
         return hidden_states
 
 
+class PoseConditioningMLP(nn.Module):
+    """Project normalized five-dimensional poses into one text-condition token."""
+
+    input_dim = 5
+
+    def __init__(self, hidden_dim: int, output_dim: int) -> None:
+        super().__init__()
+        if hidden_dim <= 0 or output_dim <= 0:
+            raise ValueError("pose adapter dimensions must be positive")
+
+        self.hidden_dim = int(hidden_dim)
+        self.output_dim = int(output_dim)
+        self.network = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.output_dim),
+        )
+
+        # Keep the initial pose signal small while allowing gradients into both
+        # linear layers from the first optimizer step.
+        nn.init.xavier_uniform_(self.network[0].weight)
+        nn.init.zeros_(self.network[0].bias)
+        nn.init.normal_(self.network[2].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.network[2].bias)
+
+    def forward(self, pose_values: torch.Tensor) -> torch.Tensor:
+        return self.network(pose_values)
+
+
 class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
     """
     OmniGen2 Transformer 2D Model.
@@ -270,10 +299,27 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         axes_dim_rope: Tuple[int, int, int] = (32, 32, 32),
         axes_lens: Tuple[int, int, int] = (300, 512, 512),
         text_feat_dim: int = 1024,
-        timestep_scale: float = 1.0
+        timestep_scale: float = 1.0,
+        pose_conditioning: bool = False,
+        pose_input_dim: int = 5,
+        pose_hidden_dim: Optional[int] = None,
+        pose_conditioning_hidden_dim: Optional[int] = None,
     ) -> None:
         """Initialize the OmniGen2 transformer model."""
         super().__init__()
+
+        if pose_input_dim != PoseConditioningMLP.input_dim:
+            raise ValueError(
+                f"pose_input_dim must be {PoseConditioningMLP.input_dim}, got {pose_input_dim}"
+            )
+        if (
+            pose_hidden_dim is not None
+            and pose_conditioning_hidden_dim is not None
+            and pose_hidden_dim != pose_conditioning_hidden_dim
+        ):
+            raise ValueError(
+                "pose_hidden_dim and its pose_conditioning_hidden_dim alias must match"
+            )
 
         # Validate configuration
         if (hidden_size // num_attention_heads) != sum(axes_dim_rope):
@@ -308,6 +354,18 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
             norm_eps=norm_eps,
             timestep_scale=timestep_scale
         )
+
+        # Kept as a separate module so checkpoint conversion can save/load it
+        # independently from PEFT LoRA weights.
+        self.pose_adapter: Optional[PoseConditioningMLP] = None
+        if pose_conditioning:
+            self.enable_pose_conditioning(
+                hidden_dim=(
+                    pose_hidden_dim
+                    if pose_hidden_dim is not None
+                    else pose_conditioning_hidden_dim
+                )
+            )
 
         # Initialize transformer blocks
         self.noise_refiner = nn.ModuleList([
@@ -391,6 +449,139 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
 
         coefficients = [-5.48259225, 11.48772289, -4.47407401, 2.47730926, -0.03316487]
         self.rescale_func = np.poly1d(coefficients)
+
+    def enable_pose_conditioning(
+        self, hidden_dim: Optional[int] = None
+    ) -> PoseConditioningMLP:
+        """Create the pose adapter, including when loading a sidecar checkpoint."""
+        configured_hidden_dim = getattr(self.config, "pose_hidden_dim", None)
+        if configured_hidden_dim is None:
+            configured_hidden_dim = getattr(
+                self.config, "pose_conditioning_hidden_dim", None
+            )
+        if hidden_dim is None:
+            hidden_dim = configured_hidden_dim
+        if hidden_dim is None:
+            hidden_dim = min(self.config.text_feat_dim, 512)
+        hidden_dim = int(hidden_dim)
+        if hidden_dim <= 0:
+            raise ValueError("pose_hidden_dim must be positive")
+
+        if self.pose_adapter is not None:
+            if self.pose_adapter.hidden_dim != hidden_dim:
+                raise ValueError(
+                    "pose adapter hidden dimension mismatch: "
+                    f"model has {self.pose_adapter.hidden_dim}, requested {hidden_dim}"
+                )
+            self.register_to_config(
+                pose_conditioning=True,
+                pose_input_dim=PoseConditioningMLP.input_dim,
+                pose_hidden_dim=hidden_dim,
+                pose_conditioning_hidden_dim=hidden_dim,
+            )
+            return self.pose_adapter
+
+        reference_parameter = next(self.parameters(), None)
+        device = reference_parameter.device if reference_parameter is not None else torch.device("cpu")
+        dtype = (
+            reference_parameter.dtype
+            if reference_parameter is not None and reference_parameter.is_floating_point()
+            else torch.float32
+        )
+        self.pose_adapter = PoseConditioningMLP(
+            hidden_dim=hidden_dim,
+            output_dim=self.config.text_feat_dim,
+        ).to(device=device, dtype=dtype)
+        self.register_to_config(
+            pose_conditioning=True,
+            pose_input_dim=PoseConditioningMLP.input_dim,
+            pose_hidden_dim=hidden_dim,
+            pose_conditioning_hidden_dim=hidden_dim,
+        )
+        return self.pose_adapter
+
+    def _append_pose_condition(
+        self,
+        text_hidden_states: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        pose_values: Optional[torch.Tensor],
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.pose_adapter is None:
+            if pose_values is not None:
+                raise ValueError(
+                    "pose_values were provided, but this transformer was created "
+                    "with pose_conditioning=False"
+                )
+            return text_hidden_states, text_attention_mask
+
+        if pose_values is None:
+            raise ValueError("pose_values are required when pose_conditioning=True")
+        if not torch.is_tensor(pose_values):
+            raise TypeError("pose_values must be a torch.Tensor with shape [B, 5]")
+        if pose_values.ndim != 2 or tuple(pose_values.shape) != (batch_size, 5):
+            raise ValueError(
+                f"pose_values must have shape [{batch_size}, 5], got {tuple(pose_values.shape)}"
+            )
+        if not pose_values.is_floating_point():
+            raise TypeError("pose_values must use a floating-point dtype")
+        if not torch.isfinite(pose_values).all().item():
+            raise ValueError("pose_values must contain only finite values")
+        if text_hidden_states.ndim != 3 or text_hidden_states.shape[0] != batch_size:
+            raise ValueError("text_hidden_states must have shape [B, sequence, text_feat_dim]")
+        if text_hidden_states.shape[-1] != self.pose_adapter.output_dim:
+            raise ValueError(
+                "text feature width does not match pose adapter output width: "
+                f"{text_hidden_states.shape[-1]} != {self.pose_adapter.output_dim}"
+            )
+        if text_attention_mask.ndim != 2 or tuple(text_attention_mask.shape) != tuple(text_hidden_states.shape[:2]):
+            raise ValueError("text_attention_mask must match the [B, sequence] text dimensions")
+        if text_hidden_states.shape[1] == 0:
+            raise ValueError("text_hidden_states must have at least one sequence position")
+
+        text_attention_mask = text_attention_mask.to(device=text_hidden_states.device)
+        valid_mask = text_attention_mask.to(dtype=torch.bool)
+        lengths = valid_mask.sum(dim=1)
+        positions = torch.arange(
+            text_hidden_states.shape[1], device=text_hidden_states.device
+        ).unsqueeze(0)
+        expected_mask = positions < lengths.unsqueeze(1)
+        if not torch.equal(valid_mask, expected_mask):
+            raise ValueError("text_attention_mask must be right padded with a contiguous valid prefix")
+
+        pose_values = pose_values.to(
+            device=text_hidden_states.device,
+            dtype=text_hidden_states.dtype,
+        )
+        pose_token = self.pose_adapter(pose_values).unsqueeze(1)
+
+        # Insert the pose immediately after each row's final valid text token.
+        # This keeps the new mask a contiguous prefix even when the input batch
+        # contains differently sized, right-padded prompts.
+        expanded_positions = torch.arange(
+            text_hidden_states.shape[1] + 1,
+            device=text_hidden_states.device,
+        ).unsqueeze(0)
+        is_text = expanded_positions < lengths.unsqueeze(1)
+        is_pose = expanded_positions == lengths.unsqueeze(1)
+        source_positions = expanded_positions - (
+            expanded_positions > lengths.unsqueeze(1)
+        ).to(dtype=expanded_positions.dtype)
+        source_positions = source_positions.clamp(min=0, max=text_hidden_states.shape[1] - 1)
+        gathered_text = text_hidden_states.gather(
+            dim=1,
+            index=source_positions.unsqueeze(-1).expand(-1, -1, text_hidden_states.shape[-1]),
+        )
+        conditioned_text = torch.where(
+            is_text.unsqueeze(-1), gathered_text, torch.zeros_like(gathered_text)
+        )
+        conditioned_text = torch.where(
+            is_pose.unsqueeze(-1), pose_token.expand(-1, conditioned_text.shape[1], -1), conditioned_text
+        )
+        conditioned_mask = (expanded_positions <= lengths.unsqueeze(1)).to(
+            dtype=text_attention_mask.dtype
+        )
+        return conditioned_text, conditioned_mask
 
     def initialize_weights(self) -> None:
         """
@@ -555,6 +746,7 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         ref_image_hidden_states: Optional[List[List[torch.Tensor]]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = False,
+        pose_values: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         enable_taylorseer = getattr(self, 'enable_taylorseer', False)
         if enable_taylorseer:
@@ -584,6 +776,13 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
             hidden_states = [_hidden_states for _hidden_states in hidden_states]
 
         device = hidden_states[0].device
+
+        text_hidden_states, text_attention_mask = self._append_pose_condition(
+            text_hidden_states,
+            text_attention_mask,
+            pose_values,
+            batch_size,
+        )
 
         temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states[0].dtype)
 
