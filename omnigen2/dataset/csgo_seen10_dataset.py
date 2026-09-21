@@ -131,6 +131,7 @@ class CSGOSeen10Dataset(Dataset):
         ref_img_dropout_prob: float = 0.0,
         *,
         image_processor: Any | None = None,
+        inference_radar_cache: dict[str, Image.Image] | None = None,
     ):
         if split not in _SPLITS:
             raise ValueError(f"Unsupported split {split!r}; expected one of {tuple(_SPLITS)}")
@@ -157,6 +158,11 @@ class CSGOSeen10Dataset(Dataset):
         )
         self.max_side_length = _side_limit(max_side_length)
         self._image_processor = image_processor
+        # The two formal test splits use the same ten map radars. Allow the
+        # inference entry point to share the resized PIL cache across splits.
+        self._inference_radar_cache = (
+            inference_radar_cache if inference_radar_cache is not None else {}
+        )
 
         self.manifest = self._read_object("benchmark_manifest.json")
         self.report = self._read_object("minimal_dataset_report.json")
@@ -632,6 +638,38 @@ class CSGOSeen10Dataset(Dataset):
             "meta_data": json.dumps(metadata, ensure_ascii=False),
             "sample_id": row["sample_id"],
             "map_name": row["map_name"],
+            "file_frame": row["file_frame"],
+            "clip_id": row["clip_id"],
+            "frame_index": row["frame_index"],
+        }
+
+    def get_inference_item(self, index: int) -> dict[str, Any]:
+        """Return inference inputs without training-only tensor preprocessing.
+
+        This path never opens the target image or calls the image processor.
+        It also returns a cached resized radar PIL image because each map uses
+        one fixed radar across every sample in both formal test splits.
+        """
+        if self.load_target:
+            raise ValueError("get_inference_item requires a dataset with load_target=False")
+        row = self.rows[index]
+        map_name = row["map_name"]
+        radar_pil = self._inference_radar_cache.get(map_name)
+        if radar_pil is None:
+            radar_pil = self._open_resized_rgb(row["radar_path"])
+            if tuple(radar_pil.size) != (_IMAGE_SIZE, _IMAGE_SIZE):
+                raise CSGOSeen10DatasetError("PIL radar resize did not produce 448x448")
+            self._inference_radar_cache[map_name] = radar_pil
+
+        metadata = dict(row["metadata"])
+        return {
+            "instruction": self._instruction(row),
+            "input_images_pil": [radar_pil],
+            "output_image": None,
+            "pose_values": torch.tensor(row["pose_values"], dtype=torch.float32),
+            "metadata": metadata,
+            "sample_id": row["sample_id"],
+            "map_name": map_name,
             "file_frame": row["file_frame"],
             "clip_id": row["clip_id"],
             "frame_index": row["frame_index"],

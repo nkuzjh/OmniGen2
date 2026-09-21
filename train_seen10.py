@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import warnings
 from pathlib import Path
 
@@ -17,6 +18,34 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_ROOT / "options" / "csgo_seen10_lora.yml"
 DEFAULT_OUTPUT_ROOT = (
     PROJECT_ROOT / "outputs" / "csgo_benchmark_v2_seen10" / "OmniGen2"
+)
+
+_BOOTSTRAP_FILES = {
+    "tokenizer": frozenset(
+        {
+            "added_tokens.json",
+            "chat_template.jinja",
+            "merges.txt",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        }
+    ),
+    "text_encoder": frozenset(
+        {
+            "config.json",
+            "generation_config.json",
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+        }
+    ),
+}
+_SHARDED_BOOTSTRAP_WEIGHT_PATTERNS = (
+    re.compile(r"model-\d{5}-of-\d{5}\.safetensors\Z"),
+    re.compile(r"pytorch_model-\d{5}-of-\d{5}\.bin\Z"),
 )
 
 
@@ -35,7 +64,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Checkpoint path/name, or 'latest'. Existing training progress is rejected "
-            "without this flag; config/log-only failed bootstrap attempts may retry."
+            "without this flag; failed bootstrap attempts with recognized tokenizer/text "
+            "encoder assets may retry."
         ),
     )
     parser.add_argument("--max-train-steps", type=int, default=None)
@@ -50,11 +80,32 @@ def parse_args() -> argparse.Namespace:
 def _is_retryable_bootstrap_output(output_dir: Path, config_path: Path) -> bool:
     """Allow retry after failure before any model/training state was written.
 
-    setup_logging creates a copied config and a log file before pretrained
-    weights are resolved. Those files are not training progress and can safely
-    coexist with a retry. Any checkpoint, metric, model asset, visualization or
-    unknown entry remains protected by the normal no-overwrite rule.
+    setup_logging and model initialization can leave a copied config, logs, and
+    the recognized tokenizer/text-encoder files saved before training starts.
+    These derived bootstrap artifacts can coexist with a retry. Checkpoints,
+    metrics, visualizations, symlinks, and unknown files or directories remain
+    protected by the normal no-overwrite rule.
     """
+    if output_dir.is_symlink() or not output_dir.is_dir():
+        return False
+
+    def is_allowed_pretrained_artifact(path: Path) -> bool:
+        allowed_files = _BOOTSTRAP_FILES[path.name]
+        if path.is_symlink() or not path.is_dir():
+            return False
+        for artifact in path.iterdir():
+            if artifact.is_symlink() or not artifact.is_file():
+                return False
+            if artifact.name in allowed_files:
+                continue
+            if path.name == "text_encoder" and any(
+                pattern.fullmatch(artifact.name)
+                for pattern in _SHARDED_BOOTSTRAP_WEIGHT_PATTERNS
+            ):
+                continue
+            return False
+        return True
+
     for entry in output_dir.iterdir():
         if entry.name == config_path.name:
             if (
@@ -75,6 +126,10 @@ def _is_retryable_bootstrap_output(output_dir: Path, config_path: Path) -> bool:
                 ):
                     return False
             continue
+        if entry.name in _BOOTSTRAP_FILES:
+            if not is_allowed_pretrained_artifact(entry):
+                return False
+            continue
         return False
     return True
 
@@ -94,7 +149,8 @@ def build_config(cli: argparse.Namespace):
         if _is_retryable_bootstrap_output(output_dir, config_path):
             warnings.warn(
                 f"Retrying {output_dir}: it contains only bootstrap config/log files "
-                "and no checkpoint or training progress.",
+                "and recognized tokenizer/text_encoder assets, with no checkpoint "
+                "or training progress.",
                 stacklevel=2,
             )
         else:

@@ -21,7 +21,30 @@
 - 保留 Accelerate/FSDP、optimizer、transport loss 和 LoRA 路径；LoRA 训练时额外解冻 pose MLP。
 - 配置的总 step 可被 5 整除，eval/save interval 均为 `max_train_steps / 5`；每次保存更新原生恢复别名 `latest` 和协议要求的 `late`，验证最优更新 `best`。训练日志同时写 JSONL，结束时生成 loss 曲线。
 - 扩展 checkpoint 转换，使 LoRA 权重和 pose MLP 权重一起进入可推理目录。
-- 新增批量推理入口，严格按 split/clip/frame 顺序处理，每个 sample 独立且只使用 radar+pose，保存 448×448 RGB JPEG 并写推理 provenance。
+- 推理严格按 split/clip/frame 顺序处理，每个 sample 只使用 radar+pose，保存 448×448 RGB JPEG 并写推理 provenance。
+
+## 推理加速方案（不含 compile）
+
+保留旧入口 `scripts/run_csgo_seen10.sh infer --seed 0 --task all`，不要求用户增加参数即可
+使用加速路径。推理分两级优化：
+
+1. **第一优先级：batch denoising + 小批量 VAE decode。** 默认最大生成 batch 为 16，遇到
+   CUDA OOM 自动按 16、8、4、2、1 减半并重试；VAE decode microbatch 默认为 1，以限制解码
+   峰值显存。可使用 `INFERENCE_BATCH_SIZE`、`INFERENCE_DECODE_BATCH_SIZE` 环境变量，或
+   `--batch-size`、`--vae-decode-batch-size` 参数覆盖。batch 16 还没有正式 checkpoint 上的
+   实测结果，应该根据 OOM 回退和实测吞吐选择实际 batch。
+2. **第二优先级：缓存并复用重复输入计算。** 十张 radar map 的 VAE posterior 参数每次运行
+   只编码一次；每个样本使用独立 reference-posterior seed 采样，diffusion 初始 noise 也按
+   task/sample ID 使用独立 seed。缓存 negative-prompt embedding 和 RoPE 频率，LoRA 加载后
+   默认 fuse 一次。共享 radar PIL 在缓存生命周期内保持只读。
+
+以上优化不改变模型权重、prompt、采样步数、guidance 或输出尺寸；目标是保持原有生成质量。
+没有启用 `torch.compile` 或近似缓存。验收时在同一 checkpoint、seed 和样本上比较 batch 1
+与运行实际采用的 batch，记录图像吞吐和显存，并使用共享评测器比较 discrete/continuous
+指标；正式输出仍通过原 eval 命令检查。脚本入口、参数和验证流程见
+[`CSGO_SEEN10.md`](CSGO_SEEN10.md#推理加速设置)。
+正式 pending manifest 将请求的生成/decode batch 视为 provenance，断点续推需保持这两个参数；
+运行内的自动 OOM 减半不改变该约束。
 
 ## 拟修改/新增文件
 
@@ -32,9 +55,13 @@
 - `convert_ckpt_to_hf_format.py`：保存 LoRA 外的 pose adapter。
 - `options/csgo_seen10_lora.yml`：Seen-10 单种子训练配置。
 - `train_seen10.py`、`infer_seen10.py`：轻量 train/infer wrapper。
-- `scripts/run_csgo_seen10.sh`：`smoke|train|convert|infer|eval|all`，支持 `--seed`。
+- `scripts/run_csgo_seen10.sh`：`smoke|train|convert|infer|eval|all`，支持 `--seed` 和默认
+  batch16 的推理；可用 `INFERENCE_BATCH_SIZE`、`INFERENCE_DECODE_BATCH_SIZE` 或对应 CLI
+  参数覆盖。
 - `tests/test_csgo_seen10_dataset.py`、`tests/test_pose_conditioning.py`、
-  `tests/test_csgo_training_helpers.py`：数据合同、condition token、checkpoint 回读和输出 identity 的快速回归。
+  `tests/test_csgo_training_helpers.py`、`tests/test_infer_seen10_batching.py`、
+  `tests/test_pipeline_inference_caches.py`：数据合同、condition token、checkpoint 回读、批推理、
+  OOM 降级、缓存与输出 identity 的快速回归。
 - `CSGO_SEEN10.md`：环境、直接命令、checkpoint/结果路径。
 
 ## 验收

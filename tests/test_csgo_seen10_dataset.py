@@ -249,6 +249,37 @@ class TestCSGOSeen10Dataset(unittest.TestCase):
         self.assertEqual(len(processor.seen), 1)
         self.assertEqual(sample["metadata"]["image_path"], str(target_path))
 
+    def test_inference_item_skips_tensor_preprocess_and_shares_radar_pil_cache(self):
+        root = _make_bundle(self.root / "bundle")
+        processor = FakeImageProcessor()
+        radar_cache = {}
+        train_dataset = CSGOSeen10Dataset(
+            root,
+            "seen_train",
+            load_target=False,
+            image_processor=processor,
+            inference_radar_cache=radar_cache,
+        )
+        test_dataset = CSGOSeen10Dataset(
+            root,
+            "seen_discrete_test",
+            load_target=False,
+            image_processor=processor,
+            inference_radar_cache=radar_cache,
+        )
+
+        first = train_dataset.get_inference_item(0)
+        second = train_dataset.get_inference_item(1)
+        across_split = test_dataset.get_inference_item(0)
+
+        self.assertIs(first["input_images_pil"][0], second["input_images_pil"][0])
+        self.assertIs(first["input_images_pil"][0], across_split["input_images_pil"][0])
+        self.assertEqual(first["input_images_pil"][0].size, (448, 448))
+        self.assertEqual(tuple(first["pose_values"].shape), (5,))
+        self.assertIsNone(first["output_image"])
+        self.assertEqual(processor.seen, [])
+        self.assertEqual(set(radar_cache), {SEEN_MAPS[0]})
+
     def test_strict_status_and_split_count_validation(self):
         root = _make_bundle(self.root / "bundle")
         report_path = root / "minimal_dataset_report.json"

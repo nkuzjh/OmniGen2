@@ -16,8 +16,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
 import inspect
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Hashable, List, Optional, Tuple, Union
 
 import math
 
@@ -95,6 +96,25 @@ def prepare_pose_values(
     return pose_values.to(device=device, dtype=dtype).repeat_interleave(
         num_images_per_prompt, dim=0
     )
+
+
+def _validate_right_padded_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    name: str,
+) -> None:
+    """Validate a text mask once before the denoising loop."""
+    if attention_mask is None:
+        raise ValueError(f"{name} is required when pose conditioning is enabled")
+    if attention_mask.ndim != 2 or tuple(attention_mask.shape) != tuple(hidden_states.shape[:2]):
+        raise ValueError(f"{name} must match the [B, sequence] text dimensions")
+
+    valid_mask = attention_mask.to(device=hidden_states.device, dtype=torch.bool)
+    lengths = valid_mask.sum(dim=1)
+    positions = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+    expected_mask = positions < lengths.unsqueeze(1)
+    if not torch.equal(valid_mask, expected_mask):
+        raise ValueError(f"{name} must be right padded with a contiguous valid prefix")
 
 
 @dataclass
@@ -210,6 +230,259 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         self.image_processor = OmniGen2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_resize=True)
         self.default_sample_size = 128
 
+        # These inference caches only contain deterministic model outputs or
+        # posterior parameters. In particular, the random VAE samples are
+        # never retained, so each sample can keep using its own RNG seed.
+        self._vae_posterior_cache: Dict[Any, Any] = {}
+        self._empty_negative_prompt_cache: Dict[Any, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._base_rope_freqs_cache: Dict[Any, Tuple[torch.Tensor, ...]] = {}
+        self._transformer_forward_parameters = frozenset(
+            inspect.signature(self.transformer.forward).parameters.keys()
+        )
+
+    def clear_inference_caches(self) -> None:
+        """Release deterministic inference caches after changing models/devices."""
+        self._vae_posterior_cache.clear()
+        self._empty_negative_prompt_cache.clear()
+        self._base_rope_freqs_cache.clear()
+
+    @staticmethod
+    def _normalize_input_image_batch(images: Any, batch_size: int) -> List[List[Any]]:
+        """Normalize legacy B=1 images and batched per-sample reference images."""
+        supported_image_types = (PIL.Image.Image, np.ndarray, torch.Tensor)
+
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if images is None or (isinstance(images, (list, tuple)) and len(images) == 0):
+            return [[] for _ in range(batch_size)]
+
+        if isinstance(images, supported_image_types):
+            if batch_size != 1:
+                raise ValueError(
+                    "a single input image is only valid for batch_size=1; "
+                    "pass one image row per batch sample"
+                )
+            rows = [[images]]
+        elif not isinstance(images, (list, tuple)):
+            raise TypeError("input_images must be an image or a list/tuple of per-sample images")
+        elif batch_size == 1:
+            # The established B=1 API is [PIL.Image]. Also accept [[PIL.Image]]
+            # so the same batch-building code can be used for B=1 and B>1.
+            if len(images) == 1 and images[0] is None:
+                rows = [[]]
+            elif len(images) == 1 and isinstance(images[0], (list, tuple)):
+                rows = [list(images[0])]
+            else:
+                rows = [list(images)]
+        else:
+            if len(images) != batch_size:
+                raise ValueError(
+                    f"input_images must contain one row per prompt ({batch_size}), got {len(images)}"
+                )
+            rows = []
+            for index, row in enumerate(images):
+                if row is None:
+                    rows.append([])
+                elif isinstance(row, supported_image_types):
+                    rows.append([row])
+                elif isinstance(row, (list, tuple)):
+                    rows.append(list(row))
+                else:
+                    raise TypeError(
+                        f"input_images[{index}] must be an image, None, or a list/tuple of images"
+                    )
+
+        for sample_index, row in enumerate(rows):
+            for image_index, image in enumerate(row):
+                if not isinstance(image, supported_image_types):
+                    raise TypeError(
+                        f"input_images[{sample_index}][{image_index}] must be a PIL image, "
+                        "NumPy array, or torch.Tensor"
+                    )
+        return rows
+
+    @staticmethod
+    def _normalize_input_image_cache_keys(
+        cache_keys: Any,
+        image_rows: List[List[Any]],
+    ) -> Optional[List[List[Optional[Hashable]]]]:
+        """Validate cache-key rows against normalized reference-image rows."""
+        if cache_keys is None:
+            return None
+        batch_size = len(image_rows)
+        if not isinstance(cache_keys, (list, tuple)):
+            raise TypeError("input_image_cache_keys must be a list/tuple matching input_images")
+
+        if batch_size == 1:
+            if (
+                len(cache_keys) == 1
+                and isinstance(cache_keys[0], (list, tuple))
+                and len(cache_keys[0]) == len(image_rows[0])
+            ):
+                key_rows = [list(cache_keys[0])]
+            else:
+                # B=1 shorthand: [key] for the legacy [image] input shape.
+                key_rows = [list(cache_keys)]
+        else:
+            if len(cache_keys) != batch_size:
+                raise ValueError(
+                    "input_image_cache_keys must contain one key row per prompt "
+                    f"({batch_size}), got {len(cache_keys)}"
+                )
+            key_rows = []
+            for sample_index, row in enumerate(cache_keys):
+                if not isinstance(row, (list, tuple)):
+                    raise TypeError(
+                        f"input_image_cache_keys[{sample_index}] must be a list/tuple of keys"
+                    )
+                key_rows.append(list(row))
+
+        if len(key_rows) != batch_size:
+            raise ValueError("input_image_cache_keys batch dimension does not match input_images")
+        for sample_index, (keys, images) in enumerate(zip(key_rows, image_rows)):
+            if len(keys) != len(images):
+                raise ValueError(
+                    f"input_image_cache_keys[{sample_index}] has {len(keys)} entries for "
+                    f"{len(images)} input images"
+                )
+            for image_index, key in enumerate(keys):
+                if key is not None:
+                    try:
+                        hash(key)
+                    except TypeError as error:
+                        raise TypeError(
+                            f"input_image_cache_keys[{sample_index}][{image_index}] must be hashable"
+                        ) from error
+        return key_rows
+
+    @staticmethod
+    def _normalize_generators(
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]],
+        expected_length: int,
+        name: str,
+    ) -> Optional[Union[torch.Generator, List[torch.Generator]]]:
+        if generator is None or isinstance(generator, torch.Generator):
+            return generator
+        if not isinstance(generator, (list, tuple)):
+            raise TypeError(f"{name} must be a torch.Generator or a list/tuple of generators")
+        if len(generator) != expected_length:
+            raise ValueError(
+                f"{name} must contain one generator per output sample "
+                f"({expected_length}), got {len(generator)}"
+            )
+        if any(not isinstance(item, torch.Generator) for item in generator):
+            raise TypeError(f"every item in {name} must be a torch.Generator")
+        return list(generator)
+
+    @staticmethod
+    def _image_fingerprint(image: Any) -> str:
+        digest = hashlib.sha256()
+        if isinstance(image, PIL.Image.Image):
+            digest.update(image.mode.encode("utf-8"))
+            digest.update(repr(image.size).encode("ascii"))
+            digest.update(image.tobytes())
+        elif isinstance(image, np.ndarray):
+            contiguous = np.ascontiguousarray(image)
+            digest.update(str(contiguous.dtype).encode("ascii"))
+            digest.update(repr(contiguous.shape).encode("ascii"))
+            digest.update(contiguous.tobytes())
+        elif torch.is_tensor(image):
+            tensor = image.detach().to(device="cpu").contiguous()
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(repr(tuple(tensor.shape)).encode("ascii"))
+            digest.update(tensor.view(torch.uint8).numpy().tobytes())
+        else:
+            raise TypeError("cached reference images must be PIL images, NumPy arrays, or torch.Tensor")
+        return digest.hexdigest()
+
+    def _get_vae_posterior(
+        self,
+        image: Any,
+        cache_key: Optional[Hashable],
+        max_pixels: int,
+        max_side_length: int,
+        device: torch.device,
+    ):
+        cache_identity = None
+        fingerprint = None
+        cached = None
+        if cache_key is not None and not self.vae.training:
+            cache_identity = (
+                cache_key,
+                max_pixels,
+                max_side_length,
+                self.vae_scale_factor,
+                str(device),
+                str(self.vae.dtype),
+            )
+            cached = self._vae_posterior_cache.get(cache_identity)
+            if cached is not None:
+                # Keyed images are an immutable-input contract. The Seen-10
+                # runner shares read-only PIL objects, so an identity hit can
+                # avoid re-hashing every radar for every generated frame.
+                if cached["source_image"] is not image:
+                    fingerprint = self._image_fingerprint(image)
+                if fingerprint is not None and cached["fingerprint"] != fingerprint:
+                    raise ValueError(
+                        f"input image cache key {cache_key!r} was reused for different image content"
+                    )
+                return cached["distribution_class"](
+                    cached["parameters"], deterministic=cached["deterministic"]
+                )
+            fingerprint = self._image_fingerprint(image)
+
+        image_tensor = self.image_processor.preprocess(
+            image, max_pixels=max_pixels, max_side_length=max_side_length
+        ).to(device=device)
+        posterior = self.vae.encode(image_tensor.to(dtype=self.vae.dtype)).latent_dist
+        if cache_identity is not None:
+            parameters = posterior.parameters.detach().clone()
+            deterministic = bool(getattr(posterior, "deterministic", False))
+            distribution_class = posterior.__class__
+            self._vae_posterior_cache[cache_identity] = {
+                "fingerprint": fingerprint,
+                "source_image": image,
+                "parameters": parameters,
+                "deterministic": deterministic,
+                "distribution_class": distribution_class,
+            }
+            posterior = distribution_class(parameters, deterministic=deterministic)
+        return posterior
+
+    def _get_cached_empty_negative_prompt(
+        self,
+        device: torch.device,
+        max_sequence_length: Optional[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mllm_dtype = self.mllm.dtype
+        cache_key = (str(device), str(mllm_dtype), max_sequence_length)
+        cached = self._empty_negative_prompt_cache.get(cache_key)
+        if cached is None:
+            empty_prompt = self._apply_chat_template("")
+            cached = self._get_qwen2_prompt_embeds(
+                [empty_prompt],
+                device=device,
+                max_sequence_length=256 if max_sequence_length is None else max_sequence_length,
+            )
+            cached = (cached[0].detach(), cached[1].detach())
+            self._empty_negative_prompt_cache[cache_key] = cached
+        return cached
+
+    def _get_base_rope_freqs(self, device: torch.device) -> Tuple[torch.Tensor, ...]:
+        axes_dim = tuple(self.transformer.config.axes_dim_rope)
+        axes_lens = tuple(self.transformer.config.axes_lens)
+        cache_key = (axes_dim, axes_lens, 10000, device.type, device.index)
+        freqs = self._base_rope_freqs_cache.get(cache_key)
+        if freqs is None:
+            freqs = tuple(
+                freq.to(device=device)
+                for freq in OmniGen2RotaryPosEmbed.get_freqs_cis(
+                    axes_dim, axes_lens, theta=10000
+                )
+            )
+            self._base_rope_freqs_cache[cache_key] = freqs
+        return freqs
+
     def prepare_latents(
         self,
         batch_size: int,
@@ -248,7 +521,11 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
             latents = latents.to(device)
         return latents
 
-    def encode_vae(self, img: torch.FloatTensor) -> torch.FloatTensor:
+    def encode_vae(
+        self,
+        img: torch.FloatTensor,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.FloatTensor:
         """
         Encode an image into the VAE latent space.
 
@@ -258,7 +535,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         Returns:
             torch.FloatTensor: The encoded latent representation.
         """
-        z0 = self.vae.encode(img.to(dtype=self.vae.dtype)).latent_dist.sample()
+        z0 = self.vae.encode(img.to(dtype=self.vae.dtype)).latent_dist.sample(generator=generator)
         if self.vae.config.shift_factor is not None:
             z0 = z0 - self.vae.config.shift_factor
         if self.vae.config.scaling_factor is not None:
@@ -268,13 +545,15 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
 
     def prepare_image(
         self,
-        images: Union[List[PIL.Image.Image], PIL.Image.Image],
+        images: Any,
         batch_size: int,
         num_images_per_prompt: int,
         max_pixels: int,
         max_side_length: int,
         device: torch.device,
         dtype: torch.dtype,
+        reference_generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        input_image_cache_keys: Any = None,
     ) -> List[Optional[torch.FloatTensor]]:
         """
         Prepare input images for processing by encoding them into the VAE latent space.
@@ -289,21 +568,54 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         Returns:
             List[Optional[torch.FloatTensor]]: List of encoded latent representations for each image.
         """
-        if batch_size == 1:
-            images = [images]
-        latents = []
-        for i, img in enumerate(images):
-            if img is not None and len(img) > 0:
-                ref_latents = []
-                for j, img_j in enumerate(img):
-                    img_j = self.image_processor.preprocess(img_j, max_pixels=max_pixels, max_side_length=max_side_length)
-                    ref_latents.append(self.encode_vae(img_j.to(device=device)).squeeze(0))
-            else:
-                ref_latents = None
-            for _ in range(num_images_per_prompt):
-                latents.append(ref_latents)
+        if num_images_per_prompt <= 0:
+            raise ValueError("num_images_per_prompt must be a positive integer")
+        image_rows = self._normalize_input_image_batch(images, batch_size)
+        cache_key_rows = self._normalize_input_image_cache_keys(
+            input_image_cache_keys, image_rows
+        )
+        generators = self._normalize_generators(
+            reference_generator,
+            batch_size * num_images_per_prompt,
+            "reference_generator",
+        )
 
-        return latents
+        output_latents: List[Optional[List[torch.FloatTensor]]] = []
+        for sample_index, row in enumerate(image_rows):
+            for output_index in range(num_images_per_prompt):
+                output_sample_index = sample_index * num_images_per_prompt + output_index
+                if isinstance(generators, list):
+                    sample_generator = generators[output_sample_index]
+                else:
+                    sample_generator = generators
+
+                if not row:
+                    output_latents.append(None)
+                    continue
+
+                ref_latents = []
+                for image_index, image in enumerate(row):
+                    cache_key = (
+                        cache_key_rows[sample_index][image_index]
+                        if cache_key_rows is not None
+                        else None
+                    )
+                    posterior = self._get_vae_posterior(
+                        image=image,
+                        cache_key=cache_key,
+                        max_pixels=max_pixels,
+                        max_side_length=max_side_length,
+                        device=device,
+                    )
+                    latent = posterior.sample(generator=sample_generator)
+                    if self.vae.config.shift_factor is not None:
+                        latent = latent - self.vae.config.shift_factor
+                    if self.vae.config.scaling_factor is not None:
+                        latent = latent * self.vae.config.scaling_factor
+                    ref_latents.append(latent.to(dtype=dtype).squeeze(0))
+                output_latents.append(ref_latents)
+
+        return output_latents
     
     def _get_qwen2_prompt_embeds(
         self,
@@ -528,27 +840,97 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         verbose: bool = False,
         step_func=None,
         pose_values: Optional[torch.Tensor] = None,
+        reference_generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        input_image_cache_keys: Optional[Any] = None,
+        vae_decode_batch_size: Optional[int] = None,
     ):
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
+
+        if not isinstance(num_images_per_prompt, int) or isinstance(num_images_per_prompt, bool) or num_images_per_prompt <= 0:
+            raise ValueError("num_images_per_prompt must be a positive integer")
+        if vae_decode_batch_size is not None and (
+            not isinstance(vae_decode_batch_size, int)
+            or isinstance(vae_decode_batch_size, bool)
+            or vae_decode_batch_size <= 0
+        ):
+            raise ValueError("vae_decode_batch_size must be a positive integer or None")
+
+        if prompt is None:
+            if prompt_embeds is None:
+                raise ValueError("either prompt or prompt_embeds must be provided")
+            if not torch.is_tensor(prompt_embeds) or prompt_embeds.ndim != 3:
+                raise ValueError("prompt_embeds must be a tensor with shape [B, sequence, hidden_dim]")
+            batch_size = prompt_embeds.shape[0]
+        elif isinstance(prompt, str):
+            batch_size = 1
+        elif isinstance(prompt, list):
+            if not prompt:
+                raise ValueError("prompt list must contain at least one prompt")
+            if any(not isinstance(item, str) for item in prompt):
+                raise TypeError("every item in prompt must be a string")
+            batch_size = len(prompt)
+        else:
+            raise TypeError("prompt must be a string, a list of strings, or None with prompt_embeds")
+
+        if prompt_embeds is not None:
+            if not torch.is_tensor(prompt_embeds) or prompt_embeds.ndim != 3:
+                raise ValueError("prompt_embeds must be a tensor with shape [B, sequence, hidden_dim]")
+            if prompt_embeds.shape[0] != batch_size:
+                raise ValueError(
+                    f"prompt_embeds batch dimension ({prompt_embeds.shape[0]}) must match "
+                    f"prompt batch size ({batch_size})"
+                )
+
+        image_rows = self._normalize_input_image_batch(input_images, batch_size)
+        cache_key_rows = self._normalize_input_image_cache_keys(
+            input_image_cache_keys, image_rows
+        )
+        effective_batch_size = batch_size * num_images_per_prompt
+        generator = self._normalize_generators(generator, effective_batch_size, "generator")
+        reference_generator = self._normalize_generators(
+            reference_generator, effective_batch_size, "reference_generator"
+        )
 
         self._text_guidance_scale = text_guidance_scale
         self._image_guidance_scale = image_guidance_scale
         self._cfg_range = cfg_range
         self._attention_kwargs = attention_kwargs
 
-        # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
         device = self._execution_device
 
         # 3. Encode input prompt
+        use_cached_empty_negative_prompt = (
+            self.text_guidance_scale > 1.0
+            and not self.mllm.training
+            and negative_prompt_embeds is None
+            and negative_prompt_attention_mask is None
+            and (
+                negative_prompt is None
+                or negative_prompt == ""
+                or (
+                    isinstance(negative_prompt, list)
+                    and len(negative_prompt) == batch_size
+                    and all(item == "" for item in negative_prompt)
+                )
+            )
+        )
+        if use_cached_empty_negative_prompt:
+            cached_negative_embeds, cached_negative_mask = self._get_cached_empty_negative_prompt(
+                device=device,
+                max_sequence_length=max_sequence_length,
+            )
+            negative_prompt_embeds = cached_negative_embeds.expand(batch_size, -1, -1)
+            negative_prompt_attention_mask = cached_negative_mask.expand(batch_size, -1)
+            if num_images_per_prompt > 1:
+                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(
+                    num_images_per_prompt, dim=0
+                )
+                negative_prompt_attention_mask = negative_prompt_attention_mask.repeat_interleave(
+                    num_images_per_prompt, dim=0
+                )
+
         (
             prompt_embeds,
             prompt_attention_mask,
@@ -579,22 +961,33 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
             pose_conditioning_enabled=pose_conditioning_enabled,
         )
 
+        if pose_conditioning_enabled:
+            _validate_right_padded_attention_mask(
+                prompt_attention_mask, prompt_embeds, "prompt_attention_mask"
+            )
+            if negative_prompt_embeds is not None:
+                _validate_right_padded_attention_mask(
+                    negative_prompt_attention_mask,
+                    negative_prompt_embeds,
+                    "negative_prompt_attention_mask",
+                )
+
         dtype = self.vae.dtype
         # 3. Prepare control image
         ref_latents = self.prepare_image(
-            images=input_images,
+            images=image_rows,
             batch_size=batch_size,
             num_images_per_prompt=num_images_per_prompt,
             max_pixels=max_pixels,
             max_side_length=max_input_image_side_length,
             device=device,
             dtype=dtype,
+            reference_generator=reference_generator,
+            input_image_cache_keys=cache_key_rows,
         )
 
-        if input_images is None:
-            input_images = []
-        
-        if len(input_images) == 1 and align_res:
+        has_input_images = any(bool(row) for row in image_rows)
+        if batch_size == 1 and len(image_rows[0]) == 1 and align_res:
             width, height = ref_latents[0][0].shape[-1] * self.vae_scale_factor, ref_latents[0][0].shape[-2] * self.vae_scale_factor
             ori_width, ori_height = width, height
         else:
@@ -606,7 +999,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
 
             height, width = int(height * ratio) // 16 * 16, int(width * ratio) // 16 * 16
         
-        if len(input_images) == 0:
+        if not has_input_images:
             self._image_guidance_scale = 1
 
         # 4. Prepare latents.
@@ -622,11 +1015,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
             latents,
         )
 
-        freqs_cis = OmniGen2RotaryPosEmbed.get_freqs_cis(
-            self.transformer.config.axes_dim_rope,
-            self.transformer.config.axes_lens,
-            theta=10000,
-        )
+        freqs_cis = self._get_base_rope_freqs(device)
         
         image = self.processing(
             latents=latents,
@@ -643,6 +1032,8 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
             verbose=verbose,
             step_func=step_func,
             pose_values=pose_values,
+            vae_decode_batch_size=vae_decode_batch_size,
+            inputs_validated=True,
         )
 
         image = F.interpolate(image, size=(ori_height, ori_width), mode='bilinear')
@@ -673,8 +1064,16 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         verbose,
         step_func=None,
         pose_values=None,
+        vae_decode_batch_size=None,
+        inputs_validated=False,
     ):
         batch_size = latents.shape[0]
+        if vae_decode_batch_size is not None and (
+            not isinstance(vae_decode_batch_size, int)
+            or isinstance(vae_decode_batch_size, bool)
+            or vae_decode_batch_size <= 0
+        ):
+            raise ValueError("vae_decode_batch_size must be a positive integer or None")
 
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -715,6 +1114,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                     prompt_attention_mask=prompt_attention_mask,
                     ref_image_hidden_states=ref_latents,
                     pose_values=pose_values,
+                    inputs_validated=inputs_validated,
                 )
                 text_guidance_scale = self.text_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
                 image_guidance_scale = self.image_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
@@ -735,6 +1135,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         prompt_attention_mask=negative_prompt_attention_mask,
                         ref_image_hidden_states=ref_latents,
                         pose_values=pose_values,
+                        inputs_validated=inputs_validated,
                     )
 
                     if enable_taylorseer:
@@ -752,6 +1153,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         prompt_attention_mask=negative_prompt_attention_mask,
                         ref_image_hidden_states=None,
                         pose_values=pose_values,
+                        inputs_validated=inputs_validated,
                     )
 
                     model_pred = model_pred_uncond + image_guidance_scale * (model_pred_ref - model_pred_uncond) + \
@@ -772,6 +1174,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         prompt_attention_mask=negative_prompt_attention_mask,
                         ref_image_hidden_states=None,
                         pose_values=pose_values,
+                        inputs_validated=inputs_validated,
                     )
                     model_pred = model_pred_uncond + text_guidance_scale * (model_pred - model_pred_uncond)
 
@@ -794,7 +1197,17 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
             latents = latents / self.vae.config.scaling_factor
         if self.vae.config.shift_factor is not None:
             latents = latents + self.vae.config.shift_factor
-        image = self.vae.decode(latents, return_dict=False)[0]
+        if vae_decode_batch_size is None or vae_decode_batch_size >= batch_size:
+            image = self.vae.decode(latents, return_dict=False)[0]
+        else:
+            decoded = []
+            for start in range(0, batch_size, vae_decode_batch_size):
+                decoded.append(
+                    self.vae.decode(
+                        latents[start : start + vae_decode_batch_size], return_dict=False
+                    )[0]
+                )
+            image = torch.cat(decoded, dim=0)
         
         return image
 
@@ -807,20 +1220,22 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         prompt_attention_mask,
         ref_image_hidden_states,
         pose_values=None,
+        inputs_validated=False,
     ):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
         batch_size, num_channels_latents, height, width = latents.shape
         
-        forward_parameters = set(inspect.signature(self.transformer.forward).parameters.keys())
         optional_kwargs = {}
-        if 'ref_image_hidden_states' in forward_parameters:
+        if 'ref_image_hidden_states' in self._transformer_forward_parameters:
             optional_kwargs['ref_image_hidden_states'] = ref_image_hidden_states
         if pose_values is not None:
-            if 'pose_values' not in forward_parameters:
+            if 'pose_values' not in self._transformer_forward_parameters:
                 raise ValueError("the loaded transformer does not support pose_values")
             optional_kwargs['pose_values'] = pose_values
+        if inputs_validated and '_inputs_validated' in self._transformer_forward_parameters:
+            optional_kwargs['_inputs_validated'] = True
         
         model_pred = self.transformer(
             latents,

@@ -422,6 +422,13 @@ def _call_with_supported_kwargs(constructor, kwargs):
     return constructor(**filtered)
 
 
+def _to_python_config_value(value):
+    """Convert OmegaConf nodes while leaving ordinary Python values intact."""
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_object(value)
+    return value
+
+
 def _make_csgo_seen10_dataset(args, tokenizer, split, load_target):
     from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Dataset
 
@@ -431,7 +438,9 @@ def _make_csgo_seen10_dataset(args, tokenizer, split, load_target):
         "split": split,
         "tokenizer": tokenizer,
         "use_chat_template": args.data.get("use_chat_template", True),
-        "max_input_pixels": OmegaConf.to_object(args.data.get("max_input_pixels", 1024 * 1024)),
+        "max_input_pixels": _to_python_config_value(
+            args.data.get("max_input_pixels", 1024 * 1024)
+        ),
         "max_output_pixels": args.data.get("max_output_pixels", 1024 * 1024),
         "max_side_length": args.data.get("max_side_length", 2048),
         "load_target": load_target,
@@ -721,7 +730,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.train.gradient_accumulation_steps,
         mixed_precision=args.train.mixed_precision,
-        log_with=OmegaConf.to_object(args.logger.log_with),
+        log_with=_to_python_config_value(args.logger.log_with),
         project_config=accelerator_project_config,
     )
 
@@ -886,7 +895,9 @@ def main(args):
                 use_chat_template=args.data.use_chat_template,
                 prompt_dropout_prob=args.data.get('prompt_dropout_prob', 0.0),
                 ref_img_dropout_prob=args.data.get('ref_img_dropout_prob', 0.0),
-                max_input_pixels=OmegaConf.to_object(args.data.get('max_input_pixels', 1024 * 1024)),
+                max_input_pixels=_to_python_config_value(
+                    args.data.get('max_input_pixels', 1024 * 1024)
+                ),
                 max_output_pixels=args.data.get('max_output_pixels', 1024 * 1024),
                 max_side_length=args.data.get('max_side_length', 2048),
             )

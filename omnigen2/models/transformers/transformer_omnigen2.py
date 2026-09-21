@@ -506,6 +506,7 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         text_attention_mask: torch.Tensor,
         pose_values: Optional[torch.Tensor],
         batch_size: int,
+        inputs_validated: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.pose_adapter is None:
             if pose_values is not None:
@@ -525,7 +526,7 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
             )
         if not pose_values.is_floating_point():
             raise TypeError("pose_values must use a floating-point dtype")
-        if not torch.isfinite(pose_values).all().item():
+        if not inputs_validated and not torch.isfinite(pose_values).all().item():
             raise ValueError("pose_values must contain only finite values")
         if text_hidden_states.ndim != 3 or text_hidden_states.shape[0] != batch_size:
             raise ValueError("text_hidden_states must have shape [B, sequence, text_feat_dim]")
@@ -542,12 +543,13 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         text_attention_mask = text_attention_mask.to(device=text_hidden_states.device)
         valid_mask = text_attention_mask.to(dtype=torch.bool)
         lengths = valid_mask.sum(dim=1)
-        positions = torch.arange(
-            text_hidden_states.shape[1], device=text_hidden_states.device
-        ).unsqueeze(0)
-        expected_mask = positions < lengths.unsqueeze(1)
-        if not torch.equal(valid_mask, expected_mask):
-            raise ValueError("text_attention_mask must be right padded with a contiguous valid prefix")
+        if not inputs_validated:
+            positions = torch.arange(
+                text_hidden_states.shape[1], device=text_hidden_states.device
+            ).unsqueeze(0)
+            expected_mask = positions < lengths.unsqueeze(1)
+            if not torch.equal(valid_mask, expected_mask):
+                raise ValueError("text_attention_mask must be right padded with a contiguous valid prefix")
 
         pose_values = pose_values.to(
             device=text_hidden_states.device,
@@ -747,6 +749,7 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = False,
         pose_values: Optional[torch.Tensor] = None,
+        _inputs_validated: bool = False,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         enable_taylorseer = getattr(self, 'enable_taylorseer', False)
         if enable_taylorseer:
@@ -782,6 +785,7 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
             text_attention_mask,
             pose_values,
             batch_size,
+            inputs_validated=_inputs_validated,
         )
 
         temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states[0].dtype)

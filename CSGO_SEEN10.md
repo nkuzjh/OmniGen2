@@ -70,6 +70,49 @@ scripts/run_csgo_seen10.sh infer   --seed 0 --task all
 scripts/run_csgo_seen10.sh eval    --seed 0 --task all
 ```
 
+### 推理加速设置
+
+原有启动命令保持有效。默认从 batch 16 开始生成，遇到 CUDA out-of-memory 时自动把生成
+batch 减半重试，最低到 batch 1；VAE decode 默认使用 microbatch 1，降低解码阶段的显存峰值。
+batch 16 目前尚未在正式 OmniGen2 checkpoint 上实测，实际执行可能自动回退到更小 batch；
+日志会报告所用 batch。这里没有启用 `torch.compile`，也不减少 28 个 inference steps 或改变
+guidance 参数。
+
+第一优先级是把样本组成 batch 一起做 denoising，同时以较小的 VAE decode microbatch 解码。
+每个样本仍按 task 和 sample ID 派生独立的 diffusion noise seed 和 reference-posterior seed，
+不依赖样本在 batch 中的位置；自动 OOM 降级和使用相同参数的断点续推中，随机流仍与样本
+身份绑定。正式输出的 pending manifest 会校验请求的生成 batch 和 decode microbatch，断点续推
+必须保持这两个启动参数不变，避免把不同推理配置的结果混入同一输出目录。
+
+第二优先级是在一次推理运行内缓存不随样本变化的计算：十张 map radar 各自的 VAE posterior
+参数只编码一次，随后按每样本的 reference seed 采样；negative-prompt embedding 和 RoPE
+频率也只计算一次。LoRA 默认在加载后 fuse 一次，减少每次 Transformer 前向中的 adapter
+额外路径。共享 radar PIL 在缓存生命周期内按只读对象使用。缓存与 LoRA fuse 不做近似计算，
+目标是保留原有模型、prompt、28 步采样和输出质量。
+
+可用环境变量修改默认 batch，也可以在启动命令上覆盖；CLI 参数优先于环境变量：
+
+```bash
+INFERENCE_BATCH_SIZE=8 INFERENCE_DECODE_BATCH_SIZE=1 \
+  scripts/run_csgo_seen10.sh infer --seed 0 --task all
+
+scripts/run_csgo_seen10.sh infer --seed 0 --task all \
+  --batch-size 4 --vae-decode-batch-size 1
+```
+
+`--no-oom-fallback` 可关闭自动减半，`--no-fuse-lora` 可关闭 LoRA fuse。更改 batch 或
+decode microbatch 不需要更改训练或评测命令。完成正式推理后使用原评测命令检查输出完整性
+和 benchmark 指标：
+
+```bash
+scripts/run_csgo_seen10.sh infer --seed 0 --task all
+scripts/run_csgo_seen10.sh eval  --seed 0 --task all
+```
+
+提速验收应在相同 seed、checkpoint、steps 和样本上对照 batch 1 与实际选定 batch，记录
+图像/秒、峰值显存、OOM 回退次数，并比较两个 task 的共享评测器指标。batch 16 未验证前不
+作为预期吞吐或质量结果；正式运行采用自动回退后稳定使用的 batch。
+
 恢复原生 Accelerate checkpoint：
 
 ```bash
@@ -98,7 +141,9 @@ cd /home/jiahao/task/OmniGen2
   --data-root /home/jiahao/task/UniLIP/data/csgo_benchmark_v2 \
   --output-root outputs/csgo_benchmark_v2_seen10/OmniGen2/seed_0 \
   --model-path "${OMNIGEN2_MODEL_PATH:-OmniGen2/OmniGen2}" \
-  --adapter-path outputs/csgo_benchmark_v2_seen10/OmniGen2/seed_0/train/inference_adapter_best
+  --adapter-path outputs/csgo_benchmark_v2_seen10/OmniGen2/seed_0/train/inference_adapter_best \
+  --batch-size "${INFERENCE_BATCH_SIZE:-16}" \
+  --vae-decode-batch-size "${INFERENCE_DECODE_BATCH_SIZE:-1}"
 
 /home/jiahao/miniconda3/envs/UniLIP/bin/python \
   /home/jiahao/task/csgo_benchmark_v2_eval_general/run_eval.py discrete \

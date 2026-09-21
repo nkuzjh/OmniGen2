@@ -60,6 +60,13 @@ class TaskPlan:
         return self.task_root / ".inference_manifest.pending.json"
 
 
+@dataclass(frozen=True)
+class BatchGenerationResult:
+    images: list[Any]
+    effective_batch_size: int
+    had_oom_fallback: bool
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -79,6 +86,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-path", required=True, help="Converted LoRA directory with pose adapter sidecar.")
     parser.add_argument("--num-inference-steps", type=int, default=28)
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Number of manifest-ordered samples sent to OmniGen2 per pipeline call.",
+    )
+    parser.add_argument(
+        "--vae-decode-batch-size",
+        type=int,
+        default=1,
+        help="Maximum number of generated latents decoded by the VAE at once.",
+    )
+    parser.add_argument(
+        "--oom-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On CUDA out-of-memory, retry the batch in halves (default: enabled).",
+    )
+    parser.add_argument(
+        "--fuse-lora",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fuse the loaded LoRA into the transformer before inference (default: enabled).",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
@@ -94,6 +125,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--seed must be a non-negative integer")
     if args.num_inference_steps <= 0:
         raise ValueError("--num-inference-steps must be positive")
+    if getattr(args, "batch_size", 16) <= 0:
+        raise ValueError("--batch-size must be a positive integer")
+    if getattr(args, "vae_decode_batch_size", 1) <= 0:
+        raise ValueError("--vae-decode-batch-size must be a positive integer")
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("--max-samples must be a positive integer")
     if args.max_samples is not None:
@@ -321,7 +356,8 @@ def _inference_inputs(dataset: Any, identity: SampleIdentity, map_order: tuple[s
     import torch
     from PIL import Image
 
-    item = dataset[identity.index]
+    inference_item = getattr(dataset, "get_inference_item", None)
+    item = inference_item(identity.index) if callable(inference_item) else dataset[identity.index]
     if not isinstance(item, Mapping):
         raise TypeError(f"Dataset item {identity.index} must be a mapping")
     if item.get("output_image") is not None:
@@ -466,6 +502,13 @@ def _derive_sample_seed(base_seed: int, task: str, sample_id: str) -> int:
     return int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big") & ((1 << 63) - 1)
 
 
+def _derive_reference_seed(base_seed: int, task: str, sample_id: str) -> int:
+    seed_material = (
+        f"csgo_benchmark_v2\0{base_seed}\0{task}\0{sample_id}\0reference_latent"
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big") & ((1 << 63) - 1)
+
+
 def _output_path(task_root: Path, identity: SampleIdentity) -> Path:
     return task_root / "gen_imgs" / identity.map_name / f"{identity.file_frame}.jpg"
 
@@ -490,14 +533,18 @@ def _make_task_plan(
     args: argparse.Namespace,
     output_root: Path,
     checkpoint: Mapping[str, Any],
+    inference_radar_cache: dict[str, Any] | None = None,
 ) -> TaskPlan:
     split_name, _ = SPLITS[task]
-    dataset = dataset_class(
-        data_root=Path(args.data_root).expanduser().resolve(),
-        split=split_name,
-        use_chat_template=False,
-        load_target=False,
-    )
+    dataset_options = {
+        "data_root": Path(args.data_root).expanduser().resolve(),
+        "split": split_name,
+        "use_chat_template": False,
+        "load_target": False,
+    }
+    if inference_radar_cache is not None:
+        dataset_options["inference_radar_cache"] = inference_radar_cache
+    dataset = dataset_class(**dataset_options)
     if getattr(dataset, "load_target", False) is not False:
         raise ValueError("Inference requires CSGOSeen10Dataset(load_target=False)")
     dataset_length = len(dataset)
@@ -514,7 +561,7 @@ def _make_task_plan(
     maps_in_order = list(dict.fromkeys(identity.map_name for identity in identities))
     sample_sequence = "\n".join(sample_ids).encode("utf-8")
     base_manifest = {
-        "manifest_version": 1,
+        "manifest_version": 2,
         "benchmark_id": "csgo_benchmark_v2",
         "model_name": "OmniGen2",
         "task": task,
@@ -535,9 +582,21 @@ def _make_task_plan(
         "checkpoint": dict(checkpoint),
         "seed": args.seed,
         "sample_seed_derivation": "sha256('csgo_benchmark_v2\\0<base_seed>\\0<task>\\0<sample_id>') first 8 bytes masked to 63 bits",
+        "reference_sample_seed_derivation": "sha256('csgo_benchmark_v2\\0<base_seed>\\0<task>\\0<sample_id>\\0reference_latent') first 8 bytes masked to 63 bits",
+        "generator_recreated_for_each_oom_retry": True,
         "num_inference_steps": args.num_inference_steps,
         "dtype": args.dtype,
         "offload": bool(args.offload),
+        "inference_acceleration": {
+            "engine": "eager_batched",
+            "batch_size": getattr(args, "batch_size", 16),
+            "vae_decode_batch_size": getattr(args, "vae_decode_batch_size", 1),
+            "oom_fallback": bool(getattr(args, "oom_fallback", True)),
+            "oom_fallback_policy": "halve_batch_and_recreate_per_sample_generators",
+            "lora_fused": bool(getattr(args, "fuse_lora", True)),
+            "radar_pil_cache": "one_resized_rgb_pil_per_map_shared_across_tasks",
+            "radar_vae_cache": "cache_posterior_parameters_by_map_key_then_sample_per_sample",
+        },
         "guidance": {
             "text_guidance_scale": 4.0,
             "image_guidance_scale": 1.0,
@@ -703,6 +762,21 @@ def _load_pipeline(args: argparse.Namespace):
     # pose-adapter sidecar; the adapter is loaded once and shared by both tasks.
     pipeline.load_lora_weights(args.adapter_path)
 
+    if getattr(args, "fuse_lora", True):
+        fuse_lora = getattr(pipeline, "fuse_lora", None)
+        unload_lora_weights = getattr(pipeline, "unload_lora_weights", None)
+        if not callable(fuse_lora) or not callable(unload_lora_weights):
+            raise RuntimeError(
+                "LoRA fusion was requested, but this Diffusers pipeline does not expose "
+                "fuse_lora() and unload_lora_weights()"
+            )
+        fuse_lora(safe_fusing=True, components=["transformer"])
+        unload_lora_weights()
+
+    set_progress_bar_config = getattr(pipeline, "set_progress_bar_config", None)
+    if callable(set_progress_bar_config):
+        set_progress_bar_config(disable=True)
+
     if args.offload:
         pipeline.enable_model_cpu_offload()
     else:
@@ -710,67 +784,248 @@ def _load_pipeline(args: argparse.Namespace):
     return pipeline
 
 
-def _generate_one(pipeline: Any, prompt: str, radar_images: list[Any], pose_values: Any, seed: int, steps: int):
+def _pipeline_generator_device(pipeline: Any):
     import torch
 
-    device = getattr(pipeline, "_execution_device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    generator = torch.Generator(device=device).manual_seed(seed)
-    result = pipeline(
-        prompt=prompt,
-        input_images=radar_images,
-        pose_values=pose_values,
-        width=IMAGE_SIZE,
-        height=IMAGE_SIZE,
-        align_res=False,
-        max_pixels=IMAGE_SIZE * IMAGE_SIZE,
-        max_input_image_side_length=IMAGE_SIZE,
-        num_inference_steps=steps,
-        num_images_per_prompt=1,
-        generator=generator,
-        output_type="pil",
-        return_dict=True,
-    )
+    device = getattr(pipeline, "_execution_device", None)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
+    return device
+
+
+def _generate_batch(
+    pipeline: Any,
+    identities: list[SampleIdentity],
+    inference_inputs: list[tuple[str, list[Any], Any]],
+    *,
+    task: str,
+    base_seed: int,
+    steps: int,
+    vae_decode_batch_size: int,
+):
+    import torch
+
+    if not identities or len(identities) != len(inference_inputs):
+        raise ValueError("A generation batch must contain matching non-empty identities and inputs")
+
+    device = _pipeline_generator_device(pipeline)
+    noise_generators = [
+        torch.Generator(device=device).manual_seed(
+            _derive_sample_seed(base_seed, task, identity.sample_id)
+        )
+        for identity in identities
+    ]
+    reference_generators = [
+        torch.Generator(device=device).manual_seed(
+            _derive_reference_seed(base_seed, task, identity.sample_id)
+        )
+        for identity in identities
+    ]
+    prompts = [sample[0] for sample in inference_inputs]
+    radar_images_by_sample = [sample[1] for sample in inference_inputs]
+    pose_values = torch.cat([sample[2] for sample in inference_inputs], dim=0)
+    # The existing pipeline wraps the one-sample image list internally. Keep
+    # that B1 contract for tail and OOM-retry batches; larger batches use one
+    # radar-image list per prompt.
+    input_images = radar_images_by_sample[0] if len(identities) == 1 else radar_images_by_sample
+
+    image_cache_keys = [identity.map_name for identity in identities]
+    if len(identities) > 1:
+        image_cache_keys = [[map_name] for map_name in image_cache_keys]
+
+    with torch.inference_mode():
+        result = pipeline(
+            prompt=prompts,
+            input_images=input_images,
+            pose_values=pose_values,
+            width=IMAGE_SIZE,
+            height=IMAGE_SIZE,
+            align_res=False,
+            max_pixels=IMAGE_SIZE * IMAGE_SIZE,
+            max_input_image_side_length=IMAGE_SIZE,
+            num_inference_steps=steps,
+            num_images_per_prompt=1,
+            generator=noise_generators,
+            reference_generator=reference_generators,
+            input_image_cache_keys=image_cache_keys,
+            vae_decode_batch_size=vae_decode_batch_size,
+            output_type="pil",
+            return_dict=True,
+        )
     images = getattr(result, "images", None)
-    if not isinstance(images, (list, tuple)) or len(images) != 1:
-        raise ValueError("OmniGen2 pipeline must return exactly one image per Seen-10 sample")
-    return images[0]
+    if not isinstance(images, (list, tuple)) or len(images) != len(identities):
+        raise ValueError(
+            "OmniGen2 pipeline must return exactly one image per Seen-10 sample "
+            f"(expected {len(identities)}, got {len(images) if isinstance(images, (list, tuple)) else 'invalid'})"
+        )
+    return list(images)
 
 
-def _run_task(plan: TaskPlan, pipeline: Any, args: argparse.Namespace, map_order: tuple[str, ...]) -> None:
+def _is_out_of_memory_error(error: BaseException) -> bool:
+    try:
+        import torch
+
+        if isinstance(error, torch.cuda.OutOfMemoryError):
+            return True
+    except (ImportError, AttributeError):
+        pass
+    return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
+
+
+def _generate_batch_with_fallback(
+    pipeline: Any,
+    identities: list[SampleIdentity],
+    inference_inputs: list[tuple[str, list[Any], Any]],
+    *,
+    task: str,
+    base_seed: int,
+    steps: int,
+    vae_decode_batch_size: int,
+    oom_fallback: bool,
+):
+    if not identities or len(identities) != len(inference_inputs):
+        raise ValueError("A generation batch must contain matching non-empty identities and inputs")
+
+    generated_images = []
+    effective_batch_size = len(identities)
+    had_oom_fallback = False
+    cursor = 0
+    while cursor < len(identities):
+        current_batch_size = min(effective_batch_size, len(identities) - cursor)
+        end = cursor + current_batch_size
+        attempted_images = None
+        fallback_error_message = None
+        try:
+            # _generate_batch constructs fresh generators from the current
+            # identities on every attempt, including after an OOM.
+            attempted_images = _generate_batch(
+                pipeline,
+                identities[cursor:end],
+                inference_inputs[cursor:end],
+                task=task,
+                base_seed=base_seed,
+                steps=steps,
+                vae_decode_batch_size=vae_decode_batch_size,
+            )
+        except Exception as error:
+            if (
+                not oom_fallback
+                or current_batch_size <= 1
+                or not _is_out_of_memory_error(error)
+            ):
+                raise
+            fallback_error_message = str(error)
+
+        if fallback_error_message is not None:
+            # The failed pipeline call and its exception traceback have now
+            # unwound. Retry the same manifest offset at half size; once it
+            # succeeds, keep this size for all remaining samples in the batch.
+            try:
+                import gc
+                import torch
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except (ImportError, RuntimeError):
+                pass
+
+            effective_batch_size = max(1, current_batch_size // 2)
+            had_oom_fallback = True
+            continue
+
+        generated_images.extend(attempted_images)
+        cursor = end
+
+    return BatchGenerationResult(
+        images=generated_images,
+        effective_batch_size=effective_batch_size,
+        had_oom_fallback=had_oom_fallback,
+    )
+
+
+def _run_task(
+    plan: TaskPlan,
+    pipeline: Any,
+    args: argparse.Namespace,
+    map_order: tuple[str, ...],
+    *,
+    initial_batch_size: int | None = None,
+) -> int:
     expected_paths = _expected_output_paths(plan)
-    digests: list[str] = []
+    digests_by_sample_id: dict[str, str] = {}
     generated = 0
     skipped = 0
     total = len(plan.identities)
+    batch_size = getattr(args, "batch_size", 16)
+    vae_decode_batch_size = getattr(args, "vae_decode_batch_size", 1)
+    oom_fallback = bool(getattr(args, "oom_fallback", True))
+    effective_batch_size = min(batch_size, initial_batch_size) if initial_batch_size else batch_size
 
-    for offset, (identity, output_path) in enumerate(zip(plan.identities, expected_paths), start=1):
-        _reject_symlink_path(output_path)
-        if output_path.exists():
-            digest = _validate_existing_jpeg(output_path)
-            skipped += 1
-        else:
-            prompt, radar_images, pose_values = _inference_inputs(plan.dataset, identity, map_order)
-            sample_seed = _derive_sample_seed(args.seed, plan.task, identity.sample_id)
-            generated_image = _generate_one(
+    batch_offset = 0
+    while batch_offset < total:
+        batch_end = min(batch_offset + effective_batch_size, total)
+        batch_identities = plan.identities[batch_offset:batch_end]
+        batch_paths = expected_paths[batch_offset:batch_end]
+        missing_identities: list[SampleIdentity] = []
+        missing_paths: list[Path] = []
+
+        for identity, output_path in zip(batch_identities, batch_paths):
+            _reject_symlink_path(output_path)
+            if output_path.exists():
+                digests_by_sample_id[identity.sample_id] = _validate_existing_jpeg(output_path)
+                skipped += 1
+            else:
+                missing_identities.append(identity)
+                missing_paths.append(output_path)
+
+        if missing_identities:
+            inference_inputs = [
+                _inference_inputs(plan.dataset, identity, map_order)
+                for identity in missing_identities
+            ]
+            generation_result = _generate_batch_with_fallback(
                 pipeline=pipeline,
-                prompt=prompt,
-                radar_images=radar_images,
-                pose_values=pose_values,
-                seed=sample_seed,
+                identities=missing_identities,
+                inference_inputs=inference_inputs,
+                task=plan.task,
+                base_seed=args.seed,
                 steps=args.num_inference_steps,
+                vae_decode_batch_size=vae_decode_batch_size,
+                oom_fallback=oom_fallback,
             )
-            _atomic_create_jpeg(generated_image, output_path)
-            digest = _validate_existing_jpeg(output_path)
-            generated += 1
-        digests.append(digest)
+            generated_images = generation_result.images
+            if generation_result.had_oom_fallback:
+                next_effective_batch_size = min(
+                    effective_batch_size,
+                    generation_result.effective_batch_size,
+                )
+                if next_effective_batch_size < effective_batch_size:
+                    print(
+                        f"[{plan.task}] OOM fallback reduced effective batch size "
+                        f"{effective_batch_size} -> {next_effective_batch_size}",
+                        flush=True,
+                    )
+                    effective_batch_size = next_effective_batch_size
+            for identity, output_path, generated_image in zip(
+                missing_identities, missing_paths, generated_images
+            ):
+                _atomic_create_jpeg(generated_image, output_path)
+                digests_by_sample_id[identity.sample_id] = _validate_existing_jpeg(output_path)
+                generated += 1
 
-        if offset == 1 or offset % 100 == 0 or offset == total:
+        processed = batch_end
+        if batch_offset == 0 or processed % 100 < effective_batch_size or processed == total:
             print(
-                f"[{plan.task}] {offset}/{total} processed "
+                f"[{plan.task}] {processed}/{total} processed "
                 f"(generated={generated}, reused={skipped})",
                 flush=True,
             )
+        batch_offset = batch_end
 
+    digests = [digests_by_sample_id[identity.sample_id] for identity in plan.identities]
     final_manifest = dict(plan.base_manifest)
     final_manifest["output_hashes"] = _output_hash_entries(plan, digests, args.seed)
     _atomic_create_json(plan.final_manifest_path, final_manifest)
@@ -782,6 +1037,7 @@ def _run_task(plan: TaskPlan, pipeline: Any, args: argparse.Namespace, map_order
         pending_path.unlink()
         _fsync_directory(pending_path.parent)
     print(f"[{plan.task}] manifest: {plan.final_manifest_path}", flush=True)
+    return effective_batch_size
 
 
 def main(args: argparse.Namespace) -> None:
@@ -800,6 +1056,7 @@ def main(args: argparse.Namespace) -> None:
     map_order = tuple(SEEN_MAPS)
     checkpoint = _checkpoint_provenance(args.model_path, args.adapter_path)
     tasks = ("discrete", "continuous") if args.task == "all" else (args.task,)
+    inference_radar_cache: dict[str, Any] = {}
     plans = [
         _make_task_plan(
             task=task,
@@ -808,6 +1065,7 @@ def main(args: argparse.Namespace) -> None:
             args=args,
             output_root=output_root,
             checkpoint=checkpoint,
+            inference_radar_cache=inference_radar_cache,
         )
         for task in tasks
     ]
@@ -824,8 +1082,15 @@ def main(args: argparse.Namespace) -> None:
         return
 
     pipeline = _load_pipeline(args)
+    effective_batch_size = getattr(args, "batch_size", 16)
     for plan in incomplete_plans:
-        _run_task(plan, pipeline, args, map_order)
+        effective_batch_size = _run_task(
+            plan,
+            pipeline,
+            args,
+            map_order,
+            initial_batch_size=effective_batch_size,
+        )
 
 
 if __name__ == "__main__":

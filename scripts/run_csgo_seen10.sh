@@ -11,6 +11,8 @@ VAE_MODEL="${OMNIGEN2_VAE_MODEL_PATH:-black-forest-labs/FLUX.1-dev}"
 TEXT_ENCODER_MODEL="${OMNIGEN2_TEXT_ENCODER_MODEL_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
 OUTPUT_ROOT="${PROJECT_ROOT}/outputs/csgo_benchmark_v2_seen10/OmniGen2"
 CONFIG_PATH="${PROJECT_ROOT}/options/csgo_seen10_lora.yml"
+INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-16}"
+INFERENCE_DECODE_BATCH_SIZE="${INFERENCE_DECODE_BATCH_SIZE:-1}"
 
 # Xet token refreshes are unreliable through the proxy used on this server.
 # The regular Hub HTTP downloader supports resumable downloads and avoids the
@@ -21,6 +23,8 @@ export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-30}"
 
 usage() {
     echo "Usage: $0 {smoke|train|convert|infer|eval|all} [--seed N] [--task discrete|continuous|all] [--resume-from-checkpoint PATH|latest]"
+    echo "       infer options: [--batch-size N] [--vae-decode-batch-size N] [--no-oom-fallback] [--no-fuse-lora]"
+    echo "       batch defaults: INFERENCE_BATCH_SIZE=16, INFERENCE_DECODE_BATCH_SIZE=1"
 }
 
 if [[ $# -lt 1 ]]; then
@@ -37,6 +41,7 @@ shift
 SEED=0
 TASK=all
 RESUME_FROM_CHECKPOINT=""
+INFER_EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --seed)
@@ -66,6 +71,48 @@ while [[ $# -gt 0 ]]; do
             RESUME_FROM_CHECKPOINT="${1#*=}"
             shift
             ;;
+        --batch-size)
+            [[ "$ACTION" == "infer" || "$ACTION" == "all" ]] || {
+                echo "--batch-size is only valid for infer or all" >&2
+                exit 2
+            }
+            [[ $# -ge 2 ]] || { echo "--batch-size requires a value" >&2; exit 2; }
+            INFERENCE_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --batch-size=*)
+            [[ "$ACTION" == "infer" || "$ACTION" == "all" ]] || {
+                echo "--batch-size is only valid for infer or all" >&2
+                exit 2
+            }
+            INFERENCE_BATCH_SIZE="${1#*=}"
+            shift
+            ;;
+        --vae-decode-batch-size)
+            [[ "$ACTION" == "infer" || "$ACTION" == "all" ]] || {
+                echo "--vae-decode-batch-size is only valid for infer or all" >&2
+                exit 2
+            }
+            [[ $# -ge 2 ]] || { echo "--vae-decode-batch-size requires a value" >&2; exit 2; }
+            INFERENCE_DECODE_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --vae-decode-batch-size=*)
+            [[ "$ACTION" == "infer" || "$ACTION" == "all" ]] || {
+                echo "--vae-decode-batch-size is only valid for infer or all" >&2
+                exit 2
+            }
+            INFERENCE_DECODE_BATCH_SIZE="${1#*=}"
+            shift
+            ;;
+        --no-oom-fallback|--no-fuse-lora)
+            [[ "$ACTION" == "infer" || "$ACTION" == "all" ]] || {
+                echo "$1 is only valid for infer or all" >&2
+                exit 2
+            }
+            INFER_EXTRA_ARGS+=("$1")
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -77,6 +124,17 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$ACTION" == "infer" || "$ACTION" == "all" ]]; then
+    [[ "$INFERENCE_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
+        echo "INFERENCE_BATCH_SIZE / --batch-size must be a positive integer" >&2
+        exit 2
+    }
+    [[ "$INFERENCE_DECODE_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
+        echo "INFERENCE_DECODE_BATCH_SIZE / --vae-decode-batch-size must be a positive integer" >&2
+        exit 2
+    }
+fi
 
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "--seed must be a non-negative integer" >&2; exit 2; }
 case "$TASK" in
@@ -95,7 +153,9 @@ run_smoke() {
     "$PROJECT_PYTHON" -m pytest -q \
         tests/test_csgo_seen10_dataset.py \
         tests/test_pose_conditioning.py \
-        tests/test_csgo_training_helpers.py
+        tests/test_csgo_training_helpers.py \
+        tests/test_infer_seen10_batching.py \
+        tests/test_pipeline_inference_caches.py
     if [[ ! -e "${SEED_ROOT}/smoke" ]]; then
         "$PROJECT_PYTHON" smoke_seen10.py \
             --data-root "$DATA_ROOT" \
@@ -178,7 +238,10 @@ run_infer() {
         --model-path "$BASE_MODEL" \
         --adapter-path "$ADAPTER_ROOT" \
         --num-inference-steps "${NUM_INFERENCE_STEPS:-28}" \
-        --dtype "${INFERENCE_DTYPE:-bf16}"
+        --dtype "${INFERENCE_DTYPE:-bf16}" \
+        --batch-size "$INFERENCE_BATCH_SIZE" \
+        --vae-decode-batch-size "$INFERENCE_DECODE_BATCH_SIZE" \
+        "${INFER_EXTRA_ARGS[@]}"
 }
 
 eval_one() {
