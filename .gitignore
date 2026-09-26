@@ -159,6 +159,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-csgo-seen10/
 env/
 venv/
 ENV/

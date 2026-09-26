@@ -83,6 +83,14 @@ Some good cases of OmniGen2:
 
 ## 🚀 Quick Start
 
+### CSGO Benchmark v2 (project integration)
+
+For another Linux/NVIDIA server, use `bash scripts/setup_csgo_seen10.sh --env-only`
+and follow [CSGO_SEEN10.md, section 4](CSGO_SEEN10.md#4-新服务器初始化官方权重与路径)
+for pinned official assets, data/evaluator paths, and read-only checks.
+This separate bootstrap preserves existing environments and does not change the
+official instructions below or the legacy/aligned experiment recipes.
+
 ### 🛠️ Environment Setup
 
 #### ✅ Recommended Setup

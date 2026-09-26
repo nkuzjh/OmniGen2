@@ -1,0 +1,388 @@
+{
+  "schema_version": 1,
+  "source": "Hugging Face model_info(files_metadata=True) at fixed commits, 2026-09-27; official LFS SHA256 / Git blob IDs",
+  "repositories": [
+    {
+      "repo_id": "OmniGen2/OmniGen2",
+      "revision": "df5dca8a981d74e6c3af214c145f5c735fe72367",
+      "env": "OMNIGEN2_MODEL_PATH",
+      "files": [
+        {
+          "filename": "mllm/config.json",
+          "size": 1487,
+          "algorithm": "git-blob-sha1",
+          "digest": "48da4543dc25ce7037204b2a535832071e05e48f",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "mllm/generation_config.json",
+          "size": 291,
+          "algorithm": "git-blob-sha1",
+          "digest": "07d31c8800138fdda785b9ea1e29bd962d334a06",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "mllm/model-00001-of-00004.safetensors",
+          "size": 4972304384,
+          "algorithm": "sha256",
+          "digest": "bfe5503539cf9335017bca96cd4409cec234de71af6bbe9a6035c0952e9319c2",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "mllm/model-00002-of-00004.safetensors",
+          "size": 4932949248,
+          "algorithm": "sha256",
+          "digest": "09b6f098d029dd4fadcc032d2d9da1914204d098c04a5a38f19bba23beb3039c",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "mllm/model-00003-of-00004.safetensors",
+          "size": 4932949336,
+          "algorithm": "sha256",
+          "digest": "fa99a4bf5f586e0f6aa2e941a66283afc98df2a8c726496f717ff7939ec70651",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "mllm/model-00004-of-00004.safetensors",
+          "size": 180380208,
+          "algorithm": "sha256",
+          "digest": "e9bdab213ea510b2de9805ae054076d804fe578eb052460ed7988c8cc3aee114",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "mllm/model.safetensors.index.json",
+          "size": 65449,
+          "algorithm": "git-blob-sha1",
+          "digest": "66ca577a77e9da9d117cc0d73842411399d70434",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "model_index.json",
+          "size": 462,
+          "algorithm": "git-blob-sha1",
+          "digest": "f248a25681de6ea0069818677bdd1e53854c6085",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "processor/added_tokens.json",
+          "size": 701,
+          "algorithm": "git-blob-sha1",
+          "digest": "3697df45d46708b892e8c688a32cbd6c834c9a29",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "processor/chat_template.json",
+          "size": 1049,
+          "algorithm": "git-blob-sha1",
+          "digest": "13303be6f396b038cf397b34a8096819d403836b",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "processor/merges.txt",
+          "size": 1671853,
+          "algorithm": "git-blob-sha1",
+          "digest": "31349551d90c7606f325fe0f11bbb8bd5fa0d7c7",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "processor/preprocessor_config.json",
+          "size": 575,
+          "algorithm": "git-blob-sha1",
+          "digest": "ee08cdd031dd2f138ce236b0c995b34b4b34a6a4",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "processor/special_tokens_map.json",
+          "size": 613,
+          "algorithm": "git-blob-sha1",
+          "digest": "ac23c0aaa2434523c494330aeb79c58395378103",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "processor/tokenizer.json",
+          "size": 11422644,
+          "algorithm": "sha256",
+          "digest": "69f12bcc978e3d112e092478b218f0161ef3d4bec08792866c99d29830772f08",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "processor/tokenizer_config.json",
+          "size": 8008,
+          "algorithm": "git-blob-sha1",
+          "digest": "67688e82ccf6bf5b0fa2d95130fb8564acce6398",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "processor/vocab.json",
+          "size": 2776833,
+          "algorithm": "git-blob-sha1",
+          "digest": "4783fe10ac3adce15ac8f358ef5462739852c569",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "scheduler/scheduler_config.json",
+          "size": 150,
+          "algorithm": "git-blob-sha1",
+          "digest": "40a98bc4d65ed525538b9e32ca006bfb1be21779",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "scheduler/scheduling_flow_match_euler_discrete.py",
+          "size": 8975,
+          "algorithm": "git-blob-sha1",
+          "digest": "a610cf4d0823fd2168b35dd2a1687a85a28a3314",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "transformer/config.json",
+          "size": 494,
+          "algorithm": "git-blob-sha1",
+          "digest": "d56d1bdee22102d1da973b6975a1e31a9f9593bc",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+          "size": 9995005752,
+          "algorithm": "sha256",
+          "digest": "4d167d318d9c34833d1522dffb3fdbc424fd4e482eda35faf6b24306317052ba",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+          "size": 5873701280,
+          "algorithm": "sha256",
+          "digest": "844bd3f41ce0879c9f968934e7c7cbbc58d57e46aae2661c23ac9f6478ebd9ba",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "transformer/diffusion_pytorch_model.safetensors.index.json",
+          "size": 53645,
+          "algorithm": "git-blob-sha1",
+          "digest": "040cad7a90c14d6b722d137005b9e4cbe39af4c3",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "transformer/transformer_omnigen2.py",
+          "size": 81136,
+          "algorithm": "git-blob-sha1",
+          "digest": "a5ad1257b7e785a72fc4b6e2a422516a6818b9e2",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "vae/config.json",
+          "size": 840,
+          "algorithm": "git-blob-sha1",
+          "digest": "374b0f9ceaf4727eb29e256c337a429122855432",
+          "profiles": [
+            "legacy"
+          ]
+        },
+        {
+          "filename": "vae/diffusion_pytorch_model.safetensors",
+          "size": 335306212,
+          "algorithm": "sha256",
+          "digest": "8c717328c8ad41faab2ccfd52ae17332505c6833cf176aad56e7b58f2c4d4c94",
+          "profiles": [
+            "legacy"
+          ]
+        }
+      ]
+    },
+    {
+      "repo_id": "Qwen/Qwen2.5-VL-3B-Instruct",
+      "revision": "66285546d2b821cf421d4f5eb2576359d3770cd3",
+      "env": "OMNIGEN2_TEXT_ENCODER_MODEL_PATH",
+      "files": [
+        {
+          "filename": "chat_template.json",
+          "size": 1050,
+          "algorithm": "git-blob-sha1",
+          "digest": "732bd68bc5427d1fb6c06a59b3bf2456b2155d24",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "config.json",
+          "size": 1373,
+          "algorithm": "git-blob-sha1",
+          "digest": "0ae1866f05ab0153ad293bdc92bb1b842c4d95b1",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "generation_config.json",
+          "size": 216,
+          "algorithm": "git-blob-sha1",
+          "digest": "1dfafa23e24b68b694722c6211e7da36730e9917",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "merges.txt",
+          "size": 1671839,
+          "algorithm": "git-blob-sha1",
+          "digest": "20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "model-00001-of-00002.safetensors",
+          "size": 3982649232,
+          "algorithm": "sha256",
+          "digest": "41a8895c164b4d32bae6b302f4603fcbc1797f32dafa45c7e9bcda23c6755df8",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "model-00002-of-00002.safetensors",
+          "size": 3526688744,
+          "algorithm": "sha256",
+          "digest": "365531ff8752420e89dee707b79d021fb2d6e25abafe486f080555a4fe6972e4",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "model.safetensors.index.json",
+          "size": 65448,
+          "algorithm": "git-blob-sha1",
+          "digest": "7a3ec4f48662e38593f8cab48fe12a4f28003aba",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "preprocessor_config.json",
+          "size": 350,
+          "algorithm": "git-blob-sha1",
+          "digest": "7f3b746825e5eef53ed8ed57a91df9e86ee62c0a",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "tokenizer.json",
+          "size": 7031645,
+          "algorithm": "git-blob-sha1",
+          "digest": "443909a61d429dff23010e5bddd28ff530edda00",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "tokenizer_config.json",
+          "size": 5702,
+          "algorithm": "git-blob-sha1",
+          "digest": "91684ea3dc135a7d815e2c932054ce88c1aab41f",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "vocab.json",
+          "size": 2776833,
+          "algorithm": "git-blob-sha1",
+          "digest": "4783fe10ac3adce15ac8f358ef5462739852c569",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        }
+      ]
+    },
+    {
+      "repo_id": "black-forest-labs/FLUX.1-dev",
+      "revision": "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+      "env": "OMNIGEN2_VAE_MODEL_PATH",
+      "files": [
+        {
+          "filename": "vae/config.json",
+          "size": 820,
+          "algorithm": "git-blob-sha1",
+          "digest": "4f7c628fc8e59fc842c9846ed74414249052ba0b",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        },
+        {
+          "filename": "vae/diffusion_pytorch_model.safetensors",
+          "size": 167666902,
+          "algorithm": "sha256",
+          "digest": "f5b59a26851551b67ae1fe58d32e76486e1e812def4696a4bea97f16604d40a3",
+          "profiles": [
+            "aligned",
+            "legacy"
+          ]
+        }
+      ]
+    }
+  ]
+}

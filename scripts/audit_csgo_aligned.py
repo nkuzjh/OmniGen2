@@ -4,11 +4,13 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from csgo_runtime_paths import data_root as select_data_root, model_source
 from PIL import Image
 from transformers import AutoTokenizer
 from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Dataset, SEEN_MAPS
@@ -16,16 +18,21 @@ from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Dataset, SEEN_MAPS
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", default="/home/jiahao/task/UniLIP/data/csgo_benchmark_v2")
+    parser.add_argument("--data-root", default=None)
+    parser.add_argument("--text-encoder-model-path", default=None)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct", local_files_only=True)
+    text_encoder = model_source(args.text_encoder_model_path or os.environ.get(
+        "OMNIGEN2_TEXT_ENCODER_MODEL_PATH", "Qwen/Qwen2.5-VL-3B-Instruct"
+    ))
+    tokenizer = AutoTokenizer.from_pretrained(text_encoder, local_files_only=True)
     expected = dict(seen_train=50000, seen_validation=5000, seen_discrete_test=20000, seen_continuous=12800)
-    report = {"smoke_only": True, "splits": {}, "test_target_open_count": 0}
+    report = {"smoke_only": True, "splits": {}, "test_target_open_count": 0,
+              "text_encoder_model_path": text_encoder}
     original_open = Image.open
-    data_root = Path(args.data_root).resolve()
+    data_root = select_data_root(args.data_root).path.resolve()
     for split, count in expected.items():
         test = split in ("seen_discrete_test", "seen_continuous")
         dataset = CSGOSeen10Dataset(data_root, split, tokenizer=tokenizer, use_chat_template=True,

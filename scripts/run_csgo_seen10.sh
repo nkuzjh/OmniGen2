@@ -2,10 +2,6 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DATA_ROOT="/home/jiahao/task/UniLIP/data/csgo_benchmark_v2"
-SHARED_EVAL_DIR="/home/jiahao/task/csgo_benchmark_v2_eval_general"
-UNILIP_PYTHON="/home/jiahao/miniconda3/envs/UniLIP/bin/python"
-PROJECT_PYTHON="${OMNIGEN2_PYTHON:-${PROJECT_ROOT}/.venv/bin/python}"
 BASE_MODEL="${OMNIGEN2_MODEL_PATH:-OmniGen2/OmniGen2}"
 VAE_MODEL="${OMNIGEN2_VAE_MODEL_PATH:-black-forest-labs/FLUX.1-dev}"
 TEXT_ENCODER_MODEL="${OMNIGEN2_TEXT_ENCODER_MODEL_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
@@ -21,16 +17,9 @@ export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-120}"
 export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-30}"
 
-# The aligned profile has a separate parser/run root. Without --experiment the
-# original commands, seed defaults and checkpoint behavior remain unchanged.
-for argument in "$@"; do
-    if [[ "$argument" == "--experiment" || "$argument" == --experiment=* ]]; then
-        exec "$PROJECT_PYTHON" "$PROJECT_ROOT/scripts/run_csgo_aligned.py" "$@"
-    fi
-done
-
 usage() {
     echo "Usage: $0 {smoke|train|convert|infer|eval|all} [--seed N] [--task discrete|continuous|all] [--resume-from-checkpoint PATH|latest]"
+    echo "       paths: [--data-root PATH] [--eval-root PATH] [--eval-python PATH] [--print-paths]"
     echo "       infer options: [--batch-size N] [--vae-decode-batch-size N] [--no-oom-fallback] [--no-fuse-lora]"
     echo "       batch defaults: INFERENCE_BATCH_SIZE=16, INFERENCE_DECODE_BATCH_SIZE=1"
 }
@@ -44,14 +33,69 @@ if [[ "$1" == "-h" || "$1" == "--help" ]]; then
     exit 0
 fi
 
+MODEL_PYTHON_CANDIDATE="${OMNIGEN2_PYTHON:-${PROJECT_ROOT}/.venv/bin/python}"
+if [[ "$MODEL_PYTHON_CANDIDATE" == "~/"* ]]; then
+    MODEL_PYTHON_CANDIDATE="${HOME}/${MODEL_PYTHON_CANDIDATE:2}"
+elif [[ "$MODEL_PYTHON_CANDIDATE" != */* ]] && command -v "$MODEL_PYTHON_CANDIDATE" >/dev/null 2>&1; then
+    MODEL_PYTHON_CANDIDATE="$(command -v "$MODEL_PYTHON_CANDIDATE")"
+elif [[ "$MODEL_PYTHON_CANDIDATE" != /* ]]; then
+    MODEL_PYTHON_CANDIDATE="${PROJECT_ROOT}/${MODEL_PYTHON_CANDIDATE}"
+fi
+if [[ -x "$MODEL_PYTHON_CANDIDATE" ]]; then
+    RESOLVER_PYTHON="$MODEL_PYTHON_CANDIDATE"
+elif [[ -x "${PROJECT_ROOT}/.venv/bin/python" ]]; then
+    RESOLVER_PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    RESOLVER_PYTHON="$(command -v python3)"
+else
+    echo "Python 3 is required for CSGO path inspection: set OMNIGEN2_PYTHON or prepare .venv" >&2
+    exit 2
+fi
+
+# The aligned profile has a separate parser/run root. Without --experiment the
+# original commands, seed defaults and checkpoint behavior remain unchanged.
+for argument in "$@"; do
+    if [[ "$argument" == "--experiment" || "$argument" == --experiment=* ]]; then
+        exec "$RESOLVER_PYTHON" "$PROJECT_ROOT/scripts/run_csgo_aligned.py" "$@"
+    fi
+done
+
 ACTION="$1"
 shift
 SEED=0
 TASK=all
 RESUME_FROM_CHECKPOINT=""
 INFER_EXTRA_ARGS=()
+DATA_ROOT_ARG=""
+EVAL_ROOT_ARG=""
+EVAL_PYTHON_ARG=""
+HAS_DATA_ROOT=0
+HAS_EVAL_ROOT=0
+HAS_EVAL_PYTHON=0
+PRINT_PATHS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --data-root|--eval-root|--eval-python|--unilip-python)
+            [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
+            case "$1" in
+                --data-root) DATA_ROOT_ARG="$2"; HAS_DATA_ROOT=1 ;;
+                --eval-root) EVAL_ROOT_ARG="$2"; HAS_EVAL_ROOT=1 ;;
+                *) EVAL_PYTHON_ARG="$2"; HAS_EVAL_PYTHON=1 ;;
+            esac
+            shift 2
+            ;;
+        --data-root=*|--eval-root=*|--eval-python=*|--unilip-python=*)
+            case "$1" in
+                --data-root=*) DATA_ROOT_ARG="${1#*=}"; HAS_DATA_ROOT=1 ;;
+                --eval-root=*) EVAL_ROOT_ARG="${1#*=}"; HAS_EVAL_ROOT=1 ;;
+                *) EVAL_PYTHON_ARG="${1#*=}"; HAS_EVAL_PYTHON=1 ;;
+            esac
+            shift
+            ;;
+        --print-paths)
+            PRINT_PATHS=1
+            shift
+            ;;
         --seed)
             [[ $# -ge 2 ]] || { echo "--seed requires a value" >&2; exit 2; }
             SEED="$2"
@@ -133,6 +177,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+PATH_ARGS=(--action "$ACTION")
+(( HAS_DATA_ROOT == 0 )) || PATH_ARGS+=(--data-root "$DATA_ROOT_ARG")
+(( HAS_EVAL_ROOT == 0 )) || PATH_ARGS+=(--eval-root "$EVAL_ROOT_ARG")
+(( HAS_EVAL_PYTHON == 0 )) || PATH_ARGS+=(--eval-python "$EVAL_PYTHON_ARG")
+if (( PRINT_PATHS )); then
+    exec "$RESOLVER_PYTHON" "$PROJECT_ROOT/csgo_runtime_paths.py" "${PATH_ARGS[@]}"
+fi
+PATH_LINES="$("$RESOLVER_PYTHON" "$PROJECT_ROOT/csgo_runtime_paths.py" "${PATH_ARGS[@]}" --lines)"
+mapfile -t RESOLVED_PATHS <<< "$PATH_LINES"
+PROJECT_PYTHON="${RESOLVED_PATHS[0]}"
+DATA_ROOT="${RESOLVED_PATHS[1]}"
+SHARED_EVAL_DIR="${RESOLVED_PATHS[2]}"
+UNILIP_PYTHON="${RESOLVED_PATHS[3]}"
+
 if [[ "$ACTION" == "infer" || "$ACTION" == "all" ]]; then
     [[ "$INFERENCE_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
         echo "INFERENCE_BATCH_SIZE / --batch-size must be a positive integer" >&2
@@ -150,7 +208,13 @@ case "$TASK" in
     *) echo "--task must be discrete, continuous, or all" >&2; exit 2 ;;
 esac
 [[ -x "$PROJECT_PYTHON" ]] || { echo "Project Python is not executable: $PROJECT_PYTHON" >&2; exit 2; }
-[[ -x "$UNILIP_PYTHON" ]] || { echo "UniLIP Python is not executable: $UNILIP_PYTHON" >&2; exit 2; }
+if [[ "$ACTION" == "train" || "$ACTION" == "infer" || "$ACTION" == "all" || "$ACTION" == "smoke" || "$ACTION" == "eval" ]]; then
+    [[ -d "$DATA_ROOT" ]] || { echo "Data root is not a directory: $DATA_ROOT" >&2; exit 2; }
+fi
+if [[ "$ACTION" == "eval" || "$ACTION" == "all" || "$ACTION" == "smoke" ]]; then
+    [[ -f "${SHARED_EVAL_DIR}/run_eval.py" ]] || { echo "Evaluator is missing: ${SHARED_EVAL_DIR}/run_eval.py" >&2; exit 2; }
+    [[ -x "$UNILIP_PYTHON" ]] || { echo "Evaluator Python is not executable: $UNILIP_PYTHON" >&2; exit 2; }
+fi
 
 SEED_ROOT="${OUTPUT_ROOT}/seed_${SEED}"
 TRAIN_ROOT="${SEED_ROOT}/train"
@@ -210,6 +274,7 @@ run_train() {
         --config "$CONFIG_PATH"
         --seed "$SEED"
         --output-root "$OUTPUT_ROOT"
+        --data-root "$DATA_ROOT"
         --pretrained-model-path "$BASE_MODEL"
         --pretrained-vae-model-path "$VAE_MODEL"
         --pretrained-text-encoder-model-path "$TEXT_ENCODER_MODEL"

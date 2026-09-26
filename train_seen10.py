@@ -10,6 +10,7 @@ import warnings
 from pathlib import Path
 
 from omegaconf import OmegaConf
+from csgo_runtime_paths import data_root as select_data_root
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_ROOT / "options" / "csgo_seen10_lora.yml"
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--stop-after-updates", type=int, default=None)
     parser.add_argument("--output-root", default=None)
+    parser.add_argument("--data-root", default=None)
     parser.add_argument("--pretrained-model-path", default=None)
     parser.add_argument("--pretrained-vae-model-path", default=None)
     parser.add_argument("--pretrained-text-encoder-model-path", default=None)
@@ -143,6 +145,10 @@ def build_config(cli: argparse.Namespace):
     conf = OmegaConf.load(config_path)
     if conf.data.get("dataset_type") != "csgo_seen10":
         raise ValueError("Seen-10 launcher requires data.dataset_type=csgo_seen10")
+    selected_data = select_data_root(
+        getattr(cli, "data_root", None), config_value=conf.data.get("data_root")
+    )
+    conf.data.data_root = str(selected_data.path)
 
     smoke = bool(getattr(cli, "smoke", False))
     stop_after_updates = getattr(cli, "stop_after_updates", None)

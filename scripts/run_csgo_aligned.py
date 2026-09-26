@@ -8,12 +8,16 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 
 
 PROJECT = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(PROJECT))
+from csgo_runtime_paths import config_data_root, model_source, project_path, report, require, resolve
+
 EXPERIMENT = "csgo_seen10_exp32gen_aligned"
 DEFAULT_ROOT = PROJECT / "outputs" / EXPERIMENT / "OmniGen2"
-EVALUATOR = Path("/home/jiahao/task/csgo_benchmark_v2_eval_general")
 
 
 def parse_args(argv=None):
@@ -24,6 +28,10 @@ def parse_args(argv=None):
     p.add_argument("--inference-seed", type=int, default=42)
     p.add_argument("--output-root", type=Path, default=DEFAULT_ROOT)
     p.add_argument("--config", type=Path, default=PROJECT / "options" / f"{EXPERIMENT}.yml")
+    p.add_argument("--data-root")
+    p.add_argument("--eval-root")
+    p.add_argument("--eval-python", "--unilip-python", dest="eval_python")
+    p.add_argument("--print-paths", action="store_true", help="Inspect paths without importing the training environment.")
     p.add_argument("--num-processes", type=int, default=int(os.environ.get("NUM_PROCESSES", "1")))
     p.add_argument("--micro-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=128)
@@ -41,6 +49,11 @@ def parse_args(argv=None):
     p.add_argument("--max-samples", type=int)
     p.add_argument("--dry-run", action="store_true", help="Print commands only; no directory or model writes.")
     args = p.parse_args(argv)
+    args.output_root = project_path(args.output_root).resolve()
+    args.config = project_path(args.config).resolve()
+    args.data_config = config_data_root(args.config, explicit=args.data_root)
+    if args.print_paths:
+        return args
     if args.seed < 0 or args.inference_seed < 0:
         p.error("seeds must be non-negative")
     if args.action in {"train", "all"}:
@@ -54,22 +67,25 @@ def parse_args(argv=None):
     if (args.stop_after_updates is not None or args.max_validation_batches is not None) and not args.smoke:
         p.error("short training/validation limits require --smoke and an isolated output root")
     if args.smoke or args.max_samples is not None:
-        root = args.output_root.expanduser().resolve()
+        root = args.output_root
         if root == DEFAULT_ROOT or DEFAULT_ROOT in root.parents:
             p.error("smoke/limited runs require --output-root outside the formal aligned root")
     return args
 
 
 def commands(args):
-    python = os.environ.get("OMNIGEN2_PYTHON", str(PROJECT / ".venv/bin/python"))
-    eval_python = os.environ.get("UNILIP_PYTHON", "/home/jiahao/miniconda3/envs/UniLIP/bin/python")
-    root = args.output_root.expanduser().resolve() / f"seed_{args.seed}"
+    paths = resolve(data=args.data_root, data_config=args.data_config,
+                    evaluation=args.eval_root, evaluation_python=args.eval_python)
+    python = str(paths["model_python"].path)
+    eval_python = str(paths["eval_python"].path)
+    evaluator = paths["eval_root"].path
+    root = args.output_root / f"seed_{args.seed}"
     adapter = root / "adapters" / args.checkpoint
     predictions = root / "predictions" / args.checkpoint
-    data_root = "/home/jiahao/task/UniLIP/data/csgo_benchmark_v2"
-    model = os.environ.get("OMNIGEN2_MODEL_PATH", "OmniGen2/OmniGen2")
-    vae = os.environ.get("OMNIGEN2_VAE_MODEL_PATH", "black-forest-labs/FLUX.1-dev")
-    text = os.environ.get("OMNIGEN2_TEXT_ENCODER_MODEL_PATH", "Qwen/Qwen2.5-VL-3B-Instruct")
+    data_root = str(paths["data_root"].path)
+    model = model_source(os.environ.get("OMNIGEN2_MODEL_PATH", "OmniGen2/OmniGen2"))
+    vae = model_source(os.environ.get("OMNIGEN2_VAE_MODEL_PATH", "black-forest-labs/FLUX.1-dev"))
+    text = model_source(os.environ.get("OMNIGEN2_TEXT_ENCODER_MODEL_PATH", "Qwen/Qwen2.5-VL-3B-Instruct"))
     selected = ("train", "convert", "infer", "eval") if args.action == "all" else (args.action,)
     result = []
     for action in selected:
@@ -79,7 +95,7 @@ def commands(args):
             if args.num_processes > 1:
                 command += ["--multi_gpu"]
             command += ["train_seen10.py", "--experiment", EXPERIMENT, "--config", str(args.config),
-                        "--seed", str(args.seed), "--output-root", str(args.output_root),
+                        "--seed", str(args.seed), "--output-root", str(args.output_root), "--data-root", data_root,
                         "--micro-batch-size", str(args.micro_batch_size),
                         "--gradient-accumulation-steps", str(args.gradient_accumulation_steps),
                         "--pretrained-model-path", model, "--pretrained-vae-model-path", vae,
@@ -115,7 +131,7 @@ def commands(args):
             result.append(command)
         elif action == "eval":
             for task in ("discrete", "continuous") if args.task == "all" else (args.task,):
-                command = [eval_python, str(EVALUATOR / "run_eval.py")]
+                command = [eval_python, str(evaluator / "run_eval.py")]
                 if args.smoke:
                     command += ["smoke", task, "--limit", str(args.max_samples or 1)]
                     if task == "continuous" and (args.max_samples or 1) < 64:
@@ -133,10 +149,23 @@ def commands(args):
 
 def main(argv=None):
     args = parse_args(argv)
+    paths = resolve(data=args.data_root, data_config=args.data_config,
+                    evaluation=args.eval_root, evaluation_python=args.eval_python)
+    if args.print_paths:
+        print(json.dumps(report(paths, action=args.action), indent=2))
+        return 0
     planned = commands(args)
     if args.dry_run:
         print(json.dumps({"experiment": EXPERIMENT, "commands": planned}, indent=2))
         return 0
+    require(paths["model_python"], "Project Python")
+    if args.action in {"train", "infer", "eval", "smoke", "all"}:
+        require(paths["data_root"], "Data root")
+    if args.action in {"eval", "all"}:
+        require(paths["eval_root"], "Evaluator root")
+        require(paths["eval_python"], "Evaluator Python")
+        if not (paths["eval_root"].path / "run_eval.py").is_file():
+            raise FileNotFoundError(paths["eval_root"].path / "run_eval.py")
     for command in planned:
         print("+ " + shlex.join(command), flush=True)
         subprocess.run(command, cwd=PROJECT, check=True)

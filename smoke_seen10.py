@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
+from csgo_runtime_paths import data_root as select_data_root
 
 from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Collator, CSGOSeen10Dataset
 from omnigen2.models.transformers import block_lumina2, transformer_omnigen2
@@ -30,7 +31,6 @@ from omnigen2.models.transformers.transformer_omnigen2 import OmniGen2Transforme
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA_ROOT = Path("/home/jiahao/task/UniLIP/data/csgo_benchmark_v2")
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "csgo_benchmark_v2_seen10" / "OmniGen2"
 
 
@@ -156,7 +156,7 @@ def _sha256(path: Path) -> str:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
+    parser.add_argument("--data-root", default=None)
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -165,7 +165,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     torch.manual_seed(args.seed)
-    data_root = Path(args.data_root).expanduser().resolve()
+    data_root = select_data_root(args.data_root).path.resolve()
     seed_root = Path(args.output_root).expanduser().resolve() / f"seed_{args.seed}"
     smoke_root = seed_root / "smoke"
     if smoke_root.exists():

@@ -2,7 +2,7 @@
 
 本文记录设计依据、配方来源、模块职能、实现边界与验收标准；实际运行命令、环境、输出和带日期状态统一维护在 [CSGO_SEEN10.md](CSGO_SEEN10.md)。详细的2026-09-27实施验收保存在 [CSGO_ALIGNED_VALIDATION.md](CSGO_ALIGNED_VALIDATION.md)，旧 [CSGO_SEEN10_ALIGNED.md](CSGO_SEEN10_ALIGNED.md)仅保留跳转。
 
-参考ControlAR的**文档分工和证据记录方式**，不复制其Canny/DINO/VQ/GPT结构、数值pose注入、LoRA r32方案、compiled batch16或机器路径迁移实现。以下aligned已经实现并完成限定范围smoke；正式训练状态以主文档的日期化快照为准。
+参考ControlAR的**文档分工和证据记录方式**；后续新增环境/资产/路径初始化也参考其分工，但不复制Canny/DINO/VQ/GPT结构、数值pose注入、LoRA r32方案或compiled batch16。以下aligned已经实现并完成限定范围smoke；正式训练状态以主文档的日期化快照为准。
 
 ## 1. 决策来源与比较边界
 
@@ -124,8 +124,11 @@ checkpoint保存发生在累计边界，记录完整可训练状态、optimizer/
 | `scripts/audit_csgo_aligned.py` | 全量split/token长度与按地图图像/target隔离抽查报告 |
 | `scripts/compare_aligned_checkpoints.py` | 比较两个受信smoke checkpoint的LoRA、optimizer、scheduler、RNG、进度与validation metadata |
 | `tests/test_aligned_{training,ddp,launcher,conversion}.py`及相关dataset/inference/loader测试 | 新旧边界与关键数值语义回归 |
+| `scripts/setup_csgo_seen10.sh` / `scripts/check_csgo_environment.py` / `requirements-csgo-seen10.txt` | 新服务器隔离环境安装、已有环境只读保护、CPU导入与显式CUDA小检查 |
+| `scripts/download_csgo_seen10_assets.py` / `scripts/csgo_seen10_assets.json` | 固定官方revision、按profile获取组件、离线size/hash检查、HF snapshot环境变量输出 |
+| `csgo_runtime_paths.py`及`tests/test_csgo_{runtime_paths,environment,assets}.py` | 服务器路径/共享评测环境选择、无副作用检查与隔离回归 |
 
-未修改UniLIP、ControlAR或共享指标实现。没有把ControlAR的compiled采样、checkpoint-index preflight、portable路径解析或自动环境引导当作OmniGen2已实现功能。
+未修改UniLIP、ControlAR或共享指标实现。portable路径解析和自动环境引导现已实现，具体接口见主文档第4节；ControlAR的compiled采样和checkpoint-index preflight仍未引入。
 
 ## 5. 验收标准、已测范围与后续记录规则
 
@@ -139,4 +142,13 @@ checkpoint保存发生在累计边界，记录完整可训练状态、optimizer/
 
 2026-09-27已执行的验收包括69项测试、8项子测试、单卡micro2×累计64的两步真实训练/逐位恢复、两任务各2张推理及共享evaluator frame smoke。完整原始产物在 `outputs/aligned_smoke/20260927_acceptance/`，详见 [验收报告](CSGO_ALIGNED_VALIDATION.md)。两进程CPU/Gloo检查不等于多GPU实训；完整5000验证、时序/FID/FVD、长期收敛、batch16吞吐均未通过这次小测得到验证。
 
-本次文档整理只合并职责、核对现状和修正入口说明，不再次运行这些测试，不改变训练/推理代码、配置、权重或产物。后续变更须在本文说明方法和边界，在主文档更新可执行命令及带时间的状态；历史验收报告保留其当时范围，不将后来状态倒写为历史事实。正式实验仍由用户手动启动。
+上一次文档整理仅合并职责、核对现状与修正说明；后续新服务器初始化变更见下节，不倒写为历史GPU验收。新状态在主文档维护，历史报告保留当时范围；正式实验仍由用户手动启动。
+
+## 6. 新服务器初始化增补（2026-09-27）
+
+- 实验语义不变：两份CSGO YAML、训练/模型/数据核心、19500步和有效batch128、LoRA/LR、224/448、milestones与指标实现不改。仅入口解析服务器路径，保留旧命令。
+- 环境与模型资产分开准备；Linux fresh采用Python3.11/3.12与PyTorch2.7.1/torchvision0.22.1 cu128，直接依赖独立固定。已有可用环境只读保留；不同环境不宣称逐位等价，新机必须独立smoke。
+- 官方资产按不可变revision及字节hash审计；aligned不下载Omni bundled语言模型或FLUX完整生成模型，legacy/all补齐原生pipeline。通过显式三个snapshot路径固定加载，既不移动旧权重，也不改共享HF refs/main。
+- 数据按CLI/env/config/兼容默认解析；评测优先所选共享评测器自己的venv，显式CLI仍最高优先级，不把训练venv用于指标兜底。只读print-paths可在缺依赖机器运行，正式执行按动作检查必需路径。
+- 不自动重写checkpoint/provenance。严格源码指纹覆盖的核心文件保持不变；数据/base路径变化仍可能使旧resume被拒绝。目标是新机从官方权重开新实验，不是静默解除旧实验恢复合同。
+- 验收包括路径优先级/含空格/无评测环境训练/非cwd、旧命令、多卡命令规划、mock安装幂等/现有目录保护、离线缺失/损坏资产拒绝及本机只读检查。真实fresh安装、目标GPU smoke、正式实验均由用户手动执行；这次不下载大权重、不抢占现有任务。

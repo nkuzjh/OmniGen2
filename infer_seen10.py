@@ -13,10 +13,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from csgo_runtime_paths import data_root as select_data_root
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA_ROOT = Path("/home/jiahao/task/UniLIP/data/csgo_benchmark_v2")
 STANDARD_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "csgo_benchmark_v2_seen10" / "OmniGen2"
 DEFAULT_VAE_MODEL_PATH = "black-forest-labs/FLUX.1-dev"
 DEFAULT_TEXT_ENCODER_MODEL_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=("discrete", "continuous", "all"), default="all")
     parser.add_argument("--experiment", choices=(LEGACY_EXPERIMENT, ALIGNED_EXPERIMENT), default=LEGACY_EXPERIMENT)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
+    parser.add_argument("--data-root", default=None)
     parser.add_argument(
         "--output-root",
         default=None,
@@ -653,7 +653,7 @@ def _make_task_plan(
     split_name, _ = SPLITS[task]
     aligned = getattr(args, "experiment", LEGACY_EXPERIMENT) == ALIGNED_EXPERIMENT
     dataset_options = {
-        "data_root": Path(args.data_root).expanduser().resolve(),
+        "data_root": select_data_root(args.data_root).path.resolve(),
         "split": split_name,
         "use_chat_template": False,
         "load_target": False,
@@ -674,7 +674,7 @@ def _make_task_plan(
     if len(sample_ids) != len(set(sample_ids)):
         raise ValueError(f"Dataset split {split_name} contains duplicate sample IDs")
 
-    data_root = Path(args.data_root).expanduser().resolve()
+    data_root = select_data_root(args.data_root).path.resolve()
     protocol_hashes, radar_hashes = _dataset_hashes(dataset, data_root, task, map_order)
     if aligned:
         contract = checkpoint["aligned_adapter"]["contract_identity"]
@@ -1282,7 +1282,8 @@ def main(args: argparse.Namespace) -> None:
             else STANDARD_OUTPUT_ROOT / f"seed_{args.seed}"
         )
     )
-    data_root = Path(args.data_root).expanduser().resolve()
+    data_root = select_data_root(args.data_root).path.resolve()
+    args.data_root = str(data_root)
     if not data_root.is_dir():
         raise FileNotFoundError(f"--data-root is not a directory: {data_root}")
     from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Dataset, SEEN_MAPS
