@@ -52,6 +52,149 @@ class RecordingPipeline:
 
 
 class TestSeen10BatchedInference(unittest.TestCase):
+    def test_pending_marker_archives_script_only_change_before_any_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "discrete"
+            old = {"task": "discrete", "seed": 42, "inference_script_sha256": "a" * 64}
+            current = {**old, "inference_script_sha256": "b" * 64}
+            plan = infer_seen10.TaskPlan(
+                task="discrete", split="seen_discrete_test", dataset=object(),
+                task_root=root, identities=[], base_manifest=current,
+            )
+            infer_seen10._atomic_create_json(plan.pending_manifest_path, old)
+            infer_seen10._prepare_partial_resume(plan)
+            self.assertEqual(json.loads(plan.pending_manifest_path.read_text()), current)
+            archived = root / f".inference_manifest.pending.{'a' * 64}.superseded.json"
+            self.assertEqual(json.loads(archived.read_text()), old)
+
+    def test_pending_marker_keeps_rejecting_changes_with_existing_jpeg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "discrete"
+            old = {"task": "discrete", "seed": 42, "inference_script_sha256": "a" * 64}
+            current = {**old, "inference_script_sha256": "b" * 64}
+            plan = infer_seen10.TaskPlan(
+                task="discrete", split="seen_discrete_test", dataset=object(),
+                task_root=root, identities=[], base_manifest=current,
+            )
+            infer_seen10._atomic_create_json(plan.pending_manifest_path, old)
+            generated = root / "gen_imgs" / "cs_agency" / "file_num1_frame_0000.jpg"
+            infer_seen10._atomic_create_jpeg(Image.new("RGB", (448, 448)), generated)
+            with self.assertRaisesRegex(FileExistsError, "refusing to mix outputs"):
+                infer_seen10._prepare_partial_resume(plan)
+
+    def test_aligned_pipeline_loads_named_local_safetensors_and_slow_processor(self):
+        from diffusers import AutoencoderKL
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        from omnigen2.models.transformers.transformer_omnigen2 import OmniGen2Transformer2DModel
+        from omnigen2.pipelines.omnigen2 import pipeline_omnigen2
+        from omnigen2.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = Path(directory)
+            (adapter / "pytorch_lora_weights.safetensors").write_bytes(b"local weights")
+            args = SimpleNamespace(
+                experiment=infer_seen10.ALIGNED_EXPERIMENT,
+                dtype="bf16", offload=False, fuse_lora=False,
+                model_path="OmniGen2/OmniGen2", adapter_path=str(adapter),
+                aligned_sources={
+                    "pretrained_model_path": Path("/cached/omnigen"),
+                    "pretrained_vae_model_name_or_path": Path("/cached/flux"),
+                    "pretrained_text_encoder_model_name_or_path": Path("/cached/qwen"),
+                },
+            )
+            transformer = SimpleNamespace(config=SimpleNamespace(pose_conditioning=False), pose_adapter=None)
+            pipeline = MagicMock()
+            with (
+                patch.object(torch.cuda, "is_available", return_value=False),
+                patch.object(OmniGen2Transformer2DModel, "from_pretrained", return_value=transformer),
+                patch.object(AutoencoderKL, "from_pretrained", return_value=object()),
+                patch.object(Qwen2_5_VLForConditionalGeneration, "from_pretrained", return_value=object()),
+                patch.object(AutoProcessor, "from_pretrained", return_value=object()) as load_processor,
+                patch.object(FlowMatchEulerDiscreteScheduler, "from_pretrained", return_value=object()),
+                patch.object(pipeline_omnigen2, "OmniGen2Pipeline", return_value=pipeline),
+            ):
+                self.assertIs(infer_seen10._load_pipeline(args), pipeline)
+            pipeline.load_lora_weights.assert_called_once_with(
+                str(adapter), weight_name="pytorch_lora_weights.safetensors", local_files_only=True,
+            )
+            load_processor.assert_called_once_with("/cached/qwen", use_fast=False)
+
+    def test_aligned_generation_uses_small_reference_and_no_numeric_pose_argument(self):
+        identity = _identities(1)
+        sample_inputs = [("pose in text", [Image.new("RGB", (224, 224))], torch.zeros((1, 5)))]
+        pipeline = RecordingPipeline()
+        with patch.object(
+            infer_seen10, "_aligned_empty_negative_prompt",
+            return_value=(torch.zeros((1, 2, 4)), torch.ones((1, 2))),
+        ):
+            infer_seen10._generate_batch(
+                pipeline, identity, sample_inputs, task="discrete", base_seed=42,
+                steps=28, vae_decode_batch_size=1,
+                experiment=infer_seen10.ALIGNED_EXPERIMENT,
+            )
+        call = pipeline.calls[0]
+        self.assertNotIn("pose_values", call)
+        self.assertEqual(call["max_input_image_side_length"], 224)
+        self.assertEqual(call["max_sequence_length"], 888)
+        self.assertIn("negative_prompt_embeds", call)
+        self.assertFalse(call["align_res"])
+
+    def test_aligned_negative_prompt_uses_training_dropout_template(self):
+        class Tokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                self.messages = messages
+                return "formatted empty prompt"
+
+        class Pipeline:
+            def __init__(self):
+                self.processor = SimpleNamespace(tokenizer=Tokenizer())
+                self.mllm = SimpleNamespace(dtype=torch.bfloat16)
+                self.calls = 0
+
+            def _get_qwen2_prompt_embeds(self, **kwargs):
+                self.calls += 1
+                self.prompt = kwargs["prompt"]
+                return torch.zeros((1, 2, 4)), torch.ones((1, 2))
+
+        pipeline = Pipeline()
+        embeddings, mask = infer_seen10._aligned_empty_negative_prompt(pipeline, 3, torch.device("cpu"))
+        infer_seen10._aligned_empty_negative_prompt(pipeline, 2, torch.device("cpu"))
+        self.assertEqual(pipeline.processor.tokenizer.messages[0]["content"],
+                         "You are a helpful assistant that generates images.")
+        self.assertEqual(pipeline.processor.tokenizer.messages[1]["content"], "")
+        self.assertEqual(pipeline.prompt, ["formatted empty prompt"])
+        self.assertEqual(tuple(embeddings.shape), (3, 2, 4))
+        self.assertEqual(tuple(mask.shape), (3, 2))
+        self.assertEqual(pipeline.calls, 1)
+
+    def test_aligned_sources_require_matching_official_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            revision = "a" * 40
+            identities = {
+                "pretrained_model_path": "OmniGen2/OmniGen2",
+                "pretrained_vae_model_name_or_path": "black-forest-labs/FLUX.1-dev",
+                "pretrained_text_encoder_model_name_or_path": "Qwen/Qwen2.5-VL-3B-Instruct",
+            }
+            snapshots = {}
+            for key, repo_id in identities.items():
+                snapshot = root / ("models--" + repo_id.replace("/", "--")) / "snapshots" / revision
+                snapshot.mkdir(parents=True)
+                snapshots[key] = snapshot
+            args = SimpleNamespace(
+                model_path=str(snapshots["pretrained_model_path"]),
+                vae_model_path=str(snapshots["pretrained_vae_model_name_or_path"]),
+                text_encoder_model_path=str(snapshots["pretrained_text_encoder_model_name_or_path"]),
+            )
+            config = {"contract_identity": {"base_sources": {
+                key: {"repo_id": repo_id, "revision": revision}
+                for key, repo_id in identities.items()
+            }}}
+            self.assertEqual(infer_seen10._validated_aligned_sources(args, config), snapshots)
+            config["contract_identity"]["base_sources"]["pretrained_model_path"]["revision"] = "b" * 40
+            with self.assertRaisesRegex(ValueError, "does not match checkpoint revision"):
+                infer_seen10._validated_aligned_sources(args, config)
+
     def test_legacy_cli_arguments_keep_working_with_batched_defaults(self):
         with patch.object(
             sys,

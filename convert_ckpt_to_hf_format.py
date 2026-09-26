@@ -1,6 +1,8 @@
 import argparse
+import hashlib
 import json
 import os
+from pathlib import Path
 
 from omegaconf import OmegaConf
 
@@ -17,6 +19,180 @@ from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline
 
 POSE_ADAPTER_CONFIG_NAME = "pose_adapter_config.json"
 POSE_ADAPTER_WEIGHTS_NAME = "pose_adapter.bin"
+ALIGNED_EXPERIMENT = "csgo_seen10_exp32gen_aligned"
+ALIGNED_ADAPTER_CONFIG_NAME = "aligned_adapter_config.json"
+ALIGNED_TARGET_MODULES = ("to_k", "to_q", "to_v", "to_out.0")
+ALIGNED_LORA_MODULE_COUNT = 152
+ALIGNED_LORA_TENSOR_COUNT = 304
+ALIGNED_LORA_PARAMETER_COUNT = 5_107_200
+
+
+def _expected_aligned_lora_shapes():
+    expected = {}
+    for stack, depth in (("noise_refiner", 2), ("ref_image_refiner", 2),
+                         ("context_refiner", 2), ("layers", 32)):
+        for index in range(depth):
+            for target in ALIGNED_TARGET_MODULES:
+                module = f"{stack}.{index}.attn.{target}"
+                output_dim = 840 if target in ("to_k", "to_v") else 2520
+                expected[f"{module}.lora_A.weight"] = (8, 2520)
+                expected[f"{module}.lora_B.weight"] = (output_dim, 8)
+    return expected
+
+
+def _convert_aligned_checkpoint(conf, model_path, save_path, config_path, *, allow_smoke=False):
+    """Export the aligned attention LoRA without constructing a pose-enabled model."""
+    if conf.get("experiment") != ALIGNED_EXPERIMENT:
+        raise ValueError("Aligned conversion requires the aligned experiment config")
+    data = conf.data
+    train = conf.train
+    expected = {
+        "reference_image_size": 224,
+        "target_image_size": 448,
+        "lora_rank": 8,
+        "lora_alpha": 8,
+        "lora_dropout": 0.0,
+    }
+    observed = {
+        "reference_image_size": data.get("reference_image_size"),
+        "target_image_size": data.get("target_image_size"),
+        "lora_rank": train.get("lora_rank"),
+        "lora_alpha": train.get("lora_alpha"),
+        "lora_dropout": train.get("lora_dropout"),
+    }
+    for key, value in expected.items():
+        if observed[key] != value:
+            raise ValueError(f"Aligned config {key} must be {value!r}, got {observed[key]!r}")
+    if not train.get("lora_ft", False):
+        raise ValueError("Aligned conversion requires LoRA fine-tuning")
+    if bool(conf.model.arch_opt.get("pose_conditioning", False)) or bool(conf.model.get("pose_conditioning", False)):
+        raise ValueError("Aligned conversion requires pose conditioning disabled")
+
+    checkpoint = Path(model_path).expanduser().resolve()
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(f"Aligned conversion requires a checkpoint directory: {checkpoint}")
+    if not (checkpoint / "COMPLETE").is_file():
+        raise FileNotFoundError(f"Aligned checkpoint is not complete: {checkpoint / 'COMPLETE'}")
+    for forbidden in (POSE_ADAPTER_CONFIG_NAME, POSE_ADAPTER_WEIGHTS_NAME):
+        if (checkpoint / forbidden).exists():
+            raise ValueError(f"Aligned checkpoint contains a pose adapter: {checkpoint / forbidden}")
+    metadata_path = checkpoint / "aligned_state.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Aligned checkpoint metadata missing: {metadata_path}")
+    with metadata_path.open("r", encoding="utf-8") as metadata_file:
+        checkpoint_metadata = json.load(metadata_file)
+    if checkpoint_metadata.get("experiment", checkpoint_metadata.get("profile")) != ALIGNED_EXPERIMENT:
+        raise ValueError("Checkpoint profile does not match the aligned experiment")
+    if checkpoint_metadata.get("smoke") and not allow_smoke:
+        raise ValueError("Refusing to convert a smoke checkpoint for formal inference; pass --allow-smoke")
+    if checkpoint_metadata.get("global_step") is None:
+        raise ValueError("Aligned checkpoint metadata is missing global_step")
+    contract = checkpoint_metadata.get("contract_identity")
+    if not isinstance(contract, dict) or contract.get("profile") != ALIGNED_EXPERIMENT:
+        raise ValueError("Aligned checkpoint is missing its training contract identity")
+    contract_fingerprint = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+    if checkpoint_metadata.get("config_fingerprint") != contract_fingerprint:
+        raise ValueError("Aligned checkpoint contract fingerprint is inconsistent")
+    official_sources = {
+        "pretrained_model_path": "OmniGen2/OmniGen2",
+        "pretrained_vae_model_name_or_path": "black-forest-labs/FLUX.1-dev",
+        "pretrained_text_encoder_model_name_or_path": "Qwen/Qwen2.5-VL-3B-Instruct",
+    }
+    sources = contract.get("base_sources")
+    if not isinstance(sources, dict):
+        raise ValueError("Aligned checkpoint is missing base source identities")
+    for key, repo_id in official_sources.items():
+        source = sources.get(key)
+        if not isinstance(source, dict) or source.get("repo_id") != repo_id:
+            raise ValueError(f"Aligned checkpoint base {key} is not the official {repo_id}")
+        if not isinstance(source.get("revision"), str) or len(source["revision"]) != 40:
+            raise ValueError(f"Aligned checkpoint base {key} has no pinned revision")
+
+    adapter_dir = checkpoint / "transformer_lora"
+    if not adapter_dir.is_dir():
+        raise FileNotFoundError(f"Aligned checkpoint LoRA directory missing: {adapter_dir}")
+    for forbidden in (POSE_ADAPTER_CONFIG_NAME, POSE_ADAPTER_WEIGHTS_NAME):
+        if (adapter_dir / forbidden).exists():
+            raise ValueError(f"Aligned LoRA contains a pose adapter: {adapter_dir / forbidden}")
+    adapter_config_path = adapter_dir / "adapter_config.json"
+    adapter_weights_path = adapter_dir / "adapter_model.safetensors"
+    if not adapter_config_path.is_file() or not adapter_weights_path.is_file():
+        raise FileNotFoundError(
+            f"Aligned checkpoint requires adapter_config.json and adapter_model.safetensors in {adapter_dir}"
+        )
+    with adapter_config_path.open("r", encoding="utf-8") as adapter_config_file:
+        adapter_config = json.load(adapter_config_file)
+    if adapter_config.get("r") != 8 or adapter_config.get("lora_alpha") != 8:
+        raise ValueError("Aligned LoRA adapter must use rank=alpha=8")
+    if adapter_config.get("lora_dropout") != 0.0:
+        raise ValueError("Aligned LoRA adapter must use dropout=0")
+    if set(adapter_config.get("target_modules", ())) != set(ALIGNED_TARGET_MODULES):
+        raise ValueError("Aligned LoRA adapter must target attention projections only")
+    state_dict = load_safetensors_file(str(adapter_weights_path), device="cpu")
+    expected_shapes = _expected_aligned_lora_shapes()
+    if len(state_dict) != ALIGNED_LORA_TENSOR_COUNT:
+        raise ValueError(
+            f"Aligned LoRA needs {ALIGNED_LORA_TENSOR_COUNT} tensors; found {len(state_dict)}"
+        )
+    modules: dict[str, set[str]] = {}
+    parameter_count = 0
+    for name, tensor in state_dict.items():
+        if name not in expected_shapes:
+            raise ValueError(f"Aligned LoRA tensor is not an official attention target: {name}")
+        if tuple(tensor.shape) != expected_shapes[name]:
+            raise ValueError(
+                f"Aligned LoRA tensor {name} has shape {tuple(tensor.shape)}, "
+                f"expected {expected_shapes[name]}"
+            )
+        if "pose" in name.lower():
+            raise ValueError(f"Aligned LoRA contains pose weights: {name}")
+        if not (name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight")):
+            raise ValueError(f"Aligned LoRA contains an unexpected tensor: {name}")
+        if tensor.ndim != 2:
+            raise ValueError(f"Aligned LoRA tensor {name} must be a matrix")
+        kind = "A" if name.endswith(".lora_A.weight") else "B"
+        module = name.removesuffix(f".lora_{kind}.weight")
+        modules.setdefault(module, set()).add(kind)
+        parameter_count += tensor.numel()
+        rank = tensor.shape[0] if kind == "A" else tensor.shape[1]
+        if rank != 8:
+            raise ValueError(f"Aligned LoRA tensor {name} has rank {rank}, expected 8")
+        if not any(f".{module}.lora_" in name for module in ALIGNED_TARGET_MODULES):
+            raise ValueError(f"Aligned LoRA tensor targets a non-attention module: {name}")
+    if len(modules) != ALIGNED_LORA_MODULE_COUNT or any(parts != {"A", "B"} for parts in modules.values()):
+        raise ValueError(
+            f"Aligned LoRA requires {ALIGNED_LORA_MODULE_COUNT} complete A/B attention modules; "
+            f"found {len(modules)}"
+        )
+    if set(state_dict) != set(expected_shapes):
+        missing = sorted(set(expected_shapes) - set(state_dict))
+        raise ValueError(f"Aligned LoRA is missing official attention tensors: {missing[:3]}")
+    if parameter_count != ALIGNED_LORA_PARAMETER_COUNT:
+        raise ValueError(
+            f"Aligned LoRA requires {ALIGNED_LORA_PARAMETER_COUNT} parameters; found {parameter_count}"
+        )
+
+    OmniGen2Pipeline.save_lora_weights(
+        save_directory=save_path,
+        transformer_lora_layers=state_dict,
+    )
+    output_config = {
+        "experiment": ALIGNED_EXPERIMENT,
+        **expected,
+        "pose_conditioning": "text_only",
+        "target_modules": list(ALIGNED_TARGET_MODULES),
+        "global_step": checkpoint_metadata.get("global_step"),
+        "smoke": bool(checkpoint_metadata.get("smoke", False)),
+        "config_fingerprint": checkpoint_metadata.get("config_fingerprint"),
+        "parameter_audit_sha256": checkpoint_metadata.get("parameter_audit_sha256"),
+        "contract_identity": contract,
+        "source_config_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(),
+        "source_checkpoint": str(checkpoint),
+        "source_config": str(Path(config_path).expanduser().resolve()),
+    }
+    with open(os.path.join(save_path, ALIGNED_ADAPTER_CONFIG_NAME), "w", encoding="utf-8") as config_file:
+        json.dump(output_config, config_file, indent=2, sort_keys=True)
+        config_file.write("\n")
 
 
 def load_training_state_dict(model_path):
@@ -135,6 +311,12 @@ def main(args):
         raise FileExistsError(f"Refusing to overwrite non-empty conversion output: {save_path}")
 
     conf = OmegaConf.load(config_path)
+    if conf.get("experiment") == ALIGNED_EXPERIMENT:
+        _convert_aligned_checkpoint(
+            conf, model_path, save_path, config_path,
+            allow_smoke=getattr(args, "allow_smoke", False),
+        )
+        return
     arch_opt = conf.model.arch_opt
 
     arch_opt = OmegaConf.to_object(arch_opt)
@@ -188,6 +370,7 @@ def parse_args():
     parser.add_argument("--config_path", type=str, required=True)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--save_path", type=str, required=True)
+    parser.add_argument("--allow-smoke", action="store_true", help="Allow conversion of an aligned smoke checkpoint.")
     return parser.parse_args()
 
 

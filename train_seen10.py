@@ -11,11 +11,9 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from train import main as train_main
-
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_ROOT / "options" / "csgo_seen10_lora.yml"
+ALIGNED_CONFIG = PROJECT_ROOT / "options" / "csgo_seen10_exp32gen_aligned.yml"
 DEFAULT_OUTPUT_ROOT = (
     PROJECT_ROOT / "outputs" / "csgo_benchmark_v2_seen10" / "OmniGen2"
 )
@@ -53,9 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train OmniGen2 on the manifest-driven CSGO v2 Seen-10 split."
     )
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--experiment", default=None)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--stop-after-updates", type=int, default=None)
+    parser.add_argument("--output-root", default=None)
     parser.add_argument("--pretrained-model-path", default=None)
     parser.add_argument("--pretrained-vae-model-path", default=None)
     parser.add_argument("--pretrained-text-encoder-model-path", default=None)
@@ -72,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-validation-batches", type=int, default=None)
     parser.add_argument("--global-batch-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--dataloader-num-workers", type=int, default=None)
     return parser.parse_args()
@@ -135,17 +137,52 @@ def _is_retryable_bootstrap_output(output_dir: Path, config_path: Path) -> bool:
 
 
 def build_config(cli: argparse.Namespace):
-    config_path = Path(cli.config).expanduser().resolve()
+    experiment = getattr(cli, "experiment", None)
+    config_value = cli.config or (str(ALIGNED_CONFIG) if experiment == "csgo_seen10_exp32gen_aligned" else str(DEFAULT_CONFIG))
+    config_path = Path(config_value).expanduser().resolve()
     conf = OmegaConf.load(config_path)
     if conf.data.get("dataset_type") != "csgo_seen10":
         raise ValueError("Seen-10 launcher requires data.dataset_type=csgo_seen10")
 
+    smoke = bool(getattr(cli, "smoke", False))
+    stop_after_updates = getattr(cli, "stop_after_updates", None)
+    micro_batch_size = getattr(cli, "micro_batch_size", None)
+    aligned = experiment == "csgo_seen10_exp32gen_aligned" or conf.get("experiment") == "csgo_seen10_exp32gen_aligned"
+    seed = cli.seed if cli.seed is not None else (42 if aligned else 0)
+    if experiment is not None and experiment != conf.get("experiment", experiment):
+        raise ValueError("CLI experiment and configuration experiment disagree")
+    if aligned:
+        if experiment != "csgo_seen10_exp32gen_aligned":
+            raise ValueError("Aligned training requires explicit --experiment csgo_seen10_exp32gen_aligned")
+        if cli.max_train_steps is not None:
+            raise ValueError("Aligned optimizer budget is fixed; use --stop-after-updates for smoke runs")
+        if stop_after_updates is not None and not smoke:
+            raise ValueError("--stop-after-updates is only available with --smoke")
+        if smoke and stop_after_updates is None:
+            raise ValueError("--smoke requires --stop-after-updates")
+        if smoke and (cli.output_root is None or "aligned_smoke" not in Path(cli.output_root).parts):
+            raise ValueError("Smoke output root must include an aligned_smoke directory")
+        if not smoke and cli.output_root is not None and "aligned_smoke" in Path(cli.output_root).parts:
+            raise ValueError("Formal aligned output cannot use an aligned_smoke directory")
+        if cli.batch_size is not None and micro_batch_size is not None and cli.batch_size != micro_batch_size:
+            raise ValueError("--batch-size and --micro-batch-size disagree")
+
+    output_root = cli.output_root or str(
+        PROJECT_ROOT / "outputs" / "csgo_seen10_exp32gen_aligned" / "OmniGen2"
+        if aligned else DEFAULT_OUTPUT_ROOT
+    )
+    if aligned and not smoke and Path(output_root).expanduser().resolve() != (
+        PROJECT_ROOT / "outputs" / "csgo_seen10_exp32gen_aligned" / "OmniGen2"
+    ).resolve():
+        raise ValueError("Formal aligned output root must be outputs/csgo_seen10_exp32gen_aligned/OmniGen2")
+    if aligned and not smoke and seed != 42:
+        raise ValueError("Formal aligned seed must be 42")
     output_dir = (
-        Path(cli.output_root).expanduser().resolve()
-        / f"seed_{cli.seed}"
+        Path(output_root).expanduser().resolve()
+        / f"seed_{seed}"
         / "train"
     )
-    if output_dir.exists() and any(output_dir.iterdir()) and not cli.resume_from_checkpoint:
+    if not aligned and output_dir.exists() and any(output_dir.iterdir()) and not cli.resume_from_checkpoint:
         if _is_retryable_bootstrap_output(output_dir, config_path):
             warnings.warn(
                 f"Retrying {output_dir}: it contains only bootstrap config/log files "
@@ -159,11 +196,15 @@ def build_config(cli: argparse.Namespace):
                 "Pass --resume-from-checkpoint latest (or an explicit checkpoint) to resume."
             )
 
-    conf.seed = cli.seed
+    conf.seed = seed
     conf.root_dir = str(PROJECT_ROOT)
     conf.output_dir = str(output_dir)
     conf.config_file = str(config_path)
     conf.resume_from_checkpoint = cli.resume_from_checkpoint
+    if aligned:
+        conf.experiment = "csgo_seen10_exp32gen_aligned"
+        conf.smoke = smoke
+        conf.stop_after_updates = stop_after_updates
 
     model_overrides = {
         "pretrained_model_path": getattr(cli, "pretrained_model_path", None),
@@ -181,7 +222,7 @@ def build_config(cli: argparse.Namespace):
     overrides = {
         "max_train_steps": cli.max_train_steps,
         "global_batch_size": cli.global_batch_size,
-        "batch_size": cli.batch_size,
+        "batch_size": micro_batch_size if micro_batch_size is not None else cli.batch_size,
         "gradient_accumulation_steps": cli.gradient_accumulation_steps,
         "dataloader_num_workers": cli.dataloader_num_workers,
     }
@@ -191,6 +232,15 @@ def build_config(cli: argparse.Namespace):
 
     if cli.max_validation_batches is not None:
         conf.val.max_validation_batches = cli.max_validation_batches
+
+    if aligned:
+        if not smoke and conf.val.get("max_validation_batches") is not None:
+            raise ValueError("Formal aligned validation must use all seen_validation samples")
+        if int(conf.train.max_optimizer_steps) != 19500 or int(conf.train.max_train_steps) != 19500:
+            raise ValueError("Aligned optimizer budget must be 19500")
+        if list(conf.train.checkpoint_steps) != [4000, 8000, 12000, 16000, 19500]:
+            raise ValueError("Aligned checkpoint_steps must be [4000, 8000, 12000, 16000, 19500]")
+        return conf
 
     max_steps = int(conf.train.max_train_steps)
     if max_steps < 5 or max_steps % 5:
@@ -210,5 +260,15 @@ def build_config(cli: argparse.Namespace):
     return conf
 
 
+def _prepare_cli_environment(cli: argparse.Namespace) -> None:
+    if cli.experiment == "csgo_seen10_exp32gen_aligned":
+        # Set this before importing train/torch so cuBLAS sees it on first use.
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+
 if __name__ == "__main__":
-    train_main(build_config(parse_args()))
+    cli = parse_args()
+    _prepare_cli_environment(cli)
+    from train import main as train_main
+
+    train_main(build_config(cli))

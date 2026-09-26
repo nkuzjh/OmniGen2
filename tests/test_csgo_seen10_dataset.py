@@ -280,6 +280,42 @@ class TestCSGOSeen10Dataset(unittest.TestCase):
         self.assertEqual(processor.seen, [])
         self.assertEqual(set(radar_cache), {SEEN_MAPS[0]})
 
+    def test_aligned_reference_target_sizes_and_empty_prompt_template(self):
+        root = _make_bundle(self.root / "aligned_bundle")
+        processor = FakeImageProcessor()
+        tokenizer = FakeTokenizer()
+        dataset = CSGOSeen10Dataset(
+            root,
+            "seen_train",
+            tokenizer=tokenizer,
+            use_chat_template=True,
+            image_processor=processor,
+            reference_image_size=224,
+            target_image_size=448,
+            max_input_pixels=224 * 224,
+            max_output_pixels=448 * 448,
+        )
+        sample = dataset[0]
+        self.assertEqual(sample["input_images_pil"][0].size, (224, 224))
+        self.assertEqual(tuple(sample["input_images"][0].shape), (3, 224, 224))
+        self.assertEqual(tuple(sample["output_image"].shape), (3, 448, 448))
+        self.assertEqual([seen[0] for seen in processor.seen], [(224, 224), (448, 448)])
+        self.assertEqual(dataset._instruction(dataset.rows[0], drop_prompt=True), dataset.SYSTEM_PROMPT_DROP + "\n")
+        inference_dataset = CSGOSeen10Dataset(
+            root, "seen_discrete_test", load_target=False, reference_image_size=224,
+            target_image_size=448,
+        )
+        self.assertEqual(inference_dataset.get_inference_item(0)["input_images_pil"][0].size, (224, 224))
+
+    def test_aligned_collator_rejects_truncated_prompt(self):
+        tokenizer = FakeTokenizer()
+        sample = {
+            "instruction": "one two three four",
+            "sample_id": "sample",
+        }
+        with self.assertRaisesRegex(ValueError, "exceeding max_token_len=3"):
+            CSGOSeen10Collator(tokenizer, max_token_len=3, check_truncation=True)([sample])
+
     def test_strict_status_and_split_count_validation(self):
         root = _make_bundle(self.root / "bundle")
         report_path = root / "minimal_dataset_report.json"

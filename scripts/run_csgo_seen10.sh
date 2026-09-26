@@ -21,6 +21,14 @@ export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-120}"
 export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-30}"
 
+# The aligned profile has a separate parser/run root. Without --experiment the
+# original commands, seed defaults and checkpoint behavior remain unchanged.
+for argument in "$@"; do
+    if [[ "$argument" == "--experiment" || "$argument" == --experiment=* ]]; then
+        exec "$PROJECT_PYTHON" "$PROJECT_ROOT/scripts/run_csgo_aligned.py" "$@"
+    fi
+done
+
 usage() {
     echo "Usage: $0 {smoke|train|convert|infer|eval|all} [--seed N] [--task discrete|continuous|all] [--resume-from-checkpoint PATH|latest]"
     echo "       infer options: [--batch-size N] [--vae-decode-batch-size N] [--no-oom-fallback] [--no-fuse-lora]"

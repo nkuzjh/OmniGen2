@@ -693,6 +693,10 @@ def _save_accelerate_checkpoint(accelerator, args, global_step, seen10):
     
     
 def main(args):
+    if args.get("experiment") == "csgo_seen10_exp32gen_aligned":
+        from omnigen2.aligned_training import main as aligned_main
+
+        return aligned_main(args)
     seen10 = args.data.get("dataset_type", None) == "csgo_seen10"
     if seen10:
         if "max_train_steps" not in args.train:

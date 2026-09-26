@@ -78,7 +78,7 @@ def _finite_number(value: Any, description: str) -> float:
     return converted
 
 
-def _pixel_limit(value: Any, description: str, *, default: int) -> int:
+def _pixel_limit(value: Any, description: str, *, default: int, minimum: int = _IMAGE_AREA) -> int:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         if not value:
             raise ValueError(f"{description} cannot be an empty sequence")
@@ -88,8 +88,8 @@ def _pixel_limit(value: Any, description: str, *, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{description} must be a positive integer, got {value!r}")
     converted = int(value)
-    if converted != value or converted < _IMAGE_AREA:
-        raise ValueError(f"{description} must be at least {_IMAGE_AREA} to preserve 448x448 inputs")
+    if converted != value or converted < minimum:
+        raise ValueError(f"{description} must be at least {minimum} to preserve the requested image size")
     return converted
 
 
@@ -109,8 +109,8 @@ class CSGOSeen10Dataset(Dataset):
 
     With load_target=False, intended for inference, the dataset creates the
     target path in metadata but never opens the target image. Radar and target
-    images are PIL-bicubic-resized to 448x448 before the OmniGen2 processor;
-    processor output is checked to remain 3x448x448.
+    images are PIL-bicubic-resized before the OmniGen2 processor. The default
+    is 448x448 each; the aligned profile uses a 224x224 radar and 448x448 target.
     """
 
     SYSTEM_PROMPT = "You are a helpful assistant that generates high-quality images based on user instructions."
@@ -130,6 +130,8 @@ class CSGOSeen10Dataset(Dataset):
         prompt_dropout_prob: float = 0.0,
         ref_img_dropout_prob: float = 0.0,
         *,
+        reference_image_size: int | None = None,
+        target_image_size: int | None = None,
         image_processor: Any | None = None,
         inference_radar_cache: dict[str, Image.Image] | None = None,
     ):
@@ -147,14 +149,24 @@ class CSGOSeen10Dataset(Dataset):
         self.load_target = load_target
         if image_size != _IMAGE_SIZE:
             raise ValueError(f"CSGO benchmark images must use image_size={_IMAGE_SIZE}, got {image_size!r}")
+        reference_image_size = _IMAGE_SIZE if reference_image_size is None else reference_image_size
+        target_image_size = _IMAGE_SIZE if target_image_size is None else target_image_size
+        if reference_image_size not in (224, 448) or isinstance(reference_image_size, bool):
+            raise ValueError("reference_image_size must be 224 or 448")
+        if target_image_size != 448 or isinstance(target_image_size, bool):
+            raise ValueError("target_image_size must be 448")
         self.image_size = image_size
+        self.reference_image_size = reference_image_size
+        self.target_image_size = target_image_size
         self.prompt_dropout_prob = self._probability(prompt_dropout_prob, "prompt_dropout_prob")
         self.ref_img_dropout_prob = self._probability(ref_img_dropout_prob, "ref_img_dropout_prob")
         self.max_input_pixels = _pixel_limit(
-            max_input_pixels, "max_input_pixels", default=_IMAGE_AREA
+            max_input_pixels, "max_input_pixels", default=reference_image_size ** 2,
+            minimum=reference_image_size ** 2,
         )
         self.max_output_pixels = _pixel_limit(
-            max_output_pixels, "max_output_pixels", default=_IMAGE_AREA
+            max_output_pixels, "max_output_pixels", default=target_image_size ** 2,
+            minimum=target_image_size ** 2,
         )
         self.max_side_length = _side_limit(max_side_length)
         self._image_processor = image_processor
@@ -550,16 +562,16 @@ class CSGOSeen10Dataset(Dataset):
         return self._image_processor
 
     @staticmethod
-    def _open_resized_rgb(path: Path) -> Image.Image:
+    def _open_resized_rgb(path: Path, size: int = _IMAGE_SIZE) -> Image.Image:
         try:
             with Image.open(path) as image:
                 return image.convert("RGB").resize(
-                    (_IMAGE_SIZE, _IMAGE_SIZE), resample=_BICUBIC
+                    (size, size), resample=_BICUBIC
                 )
         except OSError as exc:
             raise OSError(f"Cannot open CSGO Benchmark image {path}: {exc}") from exc
 
-    def _preprocess(self, image: Image.Image, *, max_pixels: int) -> torch.Tensor:
+    def _preprocess(self, image: Image.Image, *, max_pixels: int, size: int) -> torch.Tensor:
         processed = self.image_processor.preprocess(
             image,
             max_pixels=max_pixels,
@@ -573,9 +585,9 @@ class CSGOSeen10Dataset(Dataset):
                     f"Image processor returned batch size {processed.shape[0]} for a single image"
                 )
             processed = processed[0]
-        if tuple(processed.shape) != (3, _IMAGE_SIZE, _IMAGE_SIZE):
+        if tuple(processed.shape) != (3, size, size):
             raise CSGOSeen10DatasetError(
-                "OmniGen2 image processor must preserve each image as 3x448x448; "
+                f"OmniGen2 image processor must preserve each image as 3x{size}x{size}; "
                 f"got {tuple(processed.shape)}"
             )
         return processed
@@ -612,15 +624,19 @@ class CSGOSeen10Dataset(Dataset):
         radar_pil = None
         radar_tensor = None
         if not drop_ref_img:
-            radar_pil = self._open_resized_rgb(row["radar_path"])
-            radar_tensor = self._preprocess(radar_pil, max_pixels=self.max_input_pixels)
-            if tuple(radar_pil.size) != (_IMAGE_SIZE, _IMAGE_SIZE):
-                raise CSGOSeen10DatasetError("PIL radar resize did not produce 448x448")
+            radar_pil = self._open_resized_rgb(row["radar_path"], self.reference_image_size)
+            radar_tensor = self._preprocess(
+                radar_pil, max_pixels=self.max_input_pixels, size=self.reference_image_size
+            )
+            if tuple(radar_pil.size) != (self.reference_image_size,) * 2:
+                raise CSGOSeen10DatasetError("PIL radar resize did not produce the reference size")
 
         output_image = None
         if self.load_target:
-            target_pil = self._open_resized_rgb(row["image_path"])
-            output_image = self._preprocess(target_pil, max_pixels=self.max_output_pixels)
+            target_pil = self._open_resized_rgb(row["image_path"], self.target_image_size)
+            output_image = self._preprocess(
+                target_pil, max_pixels=self.max_output_pixels, size=self.target_image_size
+            )
 
         metadata = dict(row["metadata"])
         return {
@@ -629,7 +645,7 @@ class CSGOSeen10Dataset(Dataset):
             "input_images": [radar_tensor] if radar_tensor is not None else None,
             "input_images_path": [str(row["radar_path"])] if radar_tensor is not None else None,
             "input_images_pil": [radar_pil] if radar_pil is not None else None,
-            "target_img_size": (_IMAGE_SIZE, _IMAGE_SIZE),
+            "target_img_size": (self.target_image_size, self.target_image_size),
             "output_image": output_image,
             "output_image_path": str(row["image_path"]) if self.load_target else None,
             "pose_values": torch.tensor(row["pose_values"], dtype=torch.float32),
@@ -655,10 +671,14 @@ class CSGOSeen10Dataset(Dataset):
         row = self.rows[index]
         map_name = row["map_name"]
         radar_pil = self._inference_radar_cache.get(map_name)
+        if radar_pil is not None and radar_pil.size != (self.reference_image_size,) * 2:
+            raise CSGOSeen10DatasetError(
+                f"Shared radar cache size mismatch for {map_name}: {radar_pil.size}"
+            )
         if radar_pil is None:
-            radar_pil = self._open_resized_rgb(row["radar_path"])
-            if tuple(radar_pil.size) != (_IMAGE_SIZE, _IMAGE_SIZE):
-                raise CSGOSeen10DatasetError("PIL radar resize did not produce 448x448")
+            radar_pil = self._open_resized_rgb(row["radar_path"], self.reference_image_size)
+            if tuple(radar_pil.size) != (self.reference_image_size,) * 2:
+                raise CSGOSeen10DatasetError("PIL radar resize did not produce the reference size")
             self._inference_radar_cache[map_name] = radar_pil
 
         metadata = dict(row["metadata"])
@@ -682,16 +702,31 @@ class CSGOSeen10Dataset(Dataset):
 class CSGOSeen10Collator:
     """Batch CSGO samples using the field names consumed by OmniGen2 train.py."""
 
-    def __init__(self, tokenizer: Any, max_token_len: int = 888):
+    def __init__(self, tokenizer: Any, max_token_len: int = 888, *, check_truncation: bool = False):
         if tokenizer is None:
             raise ValueError("CSGOSeen10Collator requires a tokenizer")
         self.tokenizer = tokenizer
         self.max_token_len = _require_integer(max_token_len, "max_token_len", minimum=1)
+        self.check_truncation = check_truncation
 
     def __call__(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if not batch:
             raise ValueError("Cannot collate an empty batch")
         instructions = [str(sample["instruction"]) for sample in batch]
+        if self.check_truncation:
+            untruncated = self.tokenizer(
+                instructions,
+                padding=False,
+                truncation=False,
+                add_special_tokens=True,
+            )
+            token_rows = untruncated["input_ids"] if isinstance(untruncated, Mapping) else untruncated.input_ids
+            for index, token_ids in enumerate(token_rows):
+                if len(token_ids) > self.max_token_len:
+                    raise ValueError(
+                        f"CSGO prompt {batch[index]['sample_id']} has {len(token_ids)} tokens, "
+                        f"exceeding max_token_len={self.max_token_len}"
+                    )
         text_inputs = self.tokenizer(
             instructions,
             padding="longest",

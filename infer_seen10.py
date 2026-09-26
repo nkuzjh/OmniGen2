@@ -18,7 +18,12 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = Path("/home/jiahao/task/UniLIP/data/csgo_benchmark_v2")
 STANDARD_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "csgo_benchmark_v2_seen10" / "OmniGen2"
+DEFAULT_VAE_MODEL_PATH = "black-forest-labs/FLUX.1-dev"
+DEFAULT_TEXT_ENCODER_MODEL_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
 IMAGE_SIZE = 448
+ALIGNED_EXPERIMENT = "csgo_seen10_exp32gen_aligned"
+LEGACY_EXPERIMENT = "legacy"
+ALIGNED_ADAPTER_CONFIG_NAME = "aligned_adapter_config.json"
 SPLITS = {
     "discrete": ("seen_discrete_test", "discrete_test.json"),
     "continuous": ("seen_continuous", "continuous_clips.json"),
@@ -75,6 +80,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--task", choices=("discrete", "continuous", "all"), default="all")
+    parser.add_argument("--experiment", choices=(LEGACY_EXPERIMENT, ALIGNED_EXPERIMENT), default=LEGACY_EXPERIMENT)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
     parser.add_argument(
@@ -83,7 +89,9 @@ def parse_args() -> argparse.Namespace:
         help="Root containing <task>/gen_imgs; defaults to the standard seed_<seed> result root.",
     )
     parser.add_argument("--model-path", required=True, help="Base OmniGen2 Diffusers pipeline path or Hub id.")
-    parser.add_argument("--adapter-path", required=True, help="Converted LoRA directory with pose adapter sidecar.")
+    parser.add_argument("--vae-model-path", default=DEFAULT_VAE_MODEL_PATH)
+    parser.add_argument("--text-encoder-model-path", default=DEFAULT_TEXT_ENCODER_MODEL_PATH)
+    parser.add_argument("--adapter-path", required=True, help="Converted LoRA directory for the selected experiment.")
     parser.add_argument("--num-inference-steps", type=int, default=28)
     parser.add_argument(
         "--batch-size",
@@ -121,6 +129,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if getattr(args, "experiment", LEGACY_EXPERIMENT) == ALIGNED_EXPERIMENT:
+        if args.seed != 42:
+            raise ValueError("Aligned experiment requires --seed 42")
+        if args.dtype != "bf16":
+            raise ValueError("Aligned experiment requires --dtype bf16")
+        if args.num_inference_steps != 28:
+            raise ValueError("Aligned experiment requires 28 Euler steps")
     if args.seed < 0:
         raise ValueError("--seed must be a non-negative integer")
     if args.num_inference_steps <= 0:
@@ -135,7 +150,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         if args.output_root is None:
             raise ValueError("--max-samples requires an explicit, separate --output-root for smoke outputs")
         candidate = Path(args.output_root).expanduser().resolve()
-        standard_root = STANDARD_OUTPUT_ROOT.resolve()
+        standard_root = (
+            PROJECT_ROOT / "outputs" / ALIGNED_EXPERIMENT / "OmniGen2"
+            if getattr(args, "experiment", LEGACY_EXPERIMENT) == ALIGNED_EXPERIMENT
+            else STANDARD_OUTPUT_ROOT
+        ).resolve()
         if candidate == standard_root:
             raise ValueError("--max-samples cannot write under the standard formal output root")
         try:
@@ -386,8 +405,9 @@ def _inference_inputs(dataset: Any, identity: SampleIdentity, map_order: tuple[s
         raise TypeError(
             f"Dataset radar input must be a PIL image, got {type(radar_image).__name__}"
         )
-    if radar_image.size != (IMAGE_SIZE, IMAGE_SIZE):
-        raise ValueError(f"Radar input must be {IMAGE_SIZE}x{IMAGE_SIZE}, got {radar_image.size}")
+    reference_size = getattr(dataset, "reference_image_size", IMAGE_SIZE)
+    if radar_image.size != (reference_size, reference_size):
+        raise ValueError(f"Radar input must be {reference_size}x{reference_size}, got {radar_image.size}")
     if radar_image.mode != "RGB":
         radar_image = radar_image.convert("RGB")
 
@@ -464,7 +484,10 @@ def _dataset_hashes(
     return protocol_hashes, radar_hashes
 
 
-def _checkpoint_provenance(model_path_value: str, adapter_path_value: str) -> dict[str, Any]:
+def _checkpoint_provenance(
+    model_path_value: str, adapter_path_value: str, experiment: str = LEGACY_EXPERIMENT,
+    model_revision: str | None = None,
+) -> dict[str, Any]:
     adapter_path = Path(adapter_path_value).expanduser().resolve()
     if not adapter_path.is_dir():
         raise FileNotFoundError(f"--adapter-path must be a local converted adapter directory: {adapter_path}")
@@ -473,13 +496,47 @@ def _checkpoint_provenance(model_path_value: str, adapter_path_value: str) -> di
         raise FileNotFoundError(
             f"No standard LoRA weight file found in {adapter_path}; expected one of {LORA_WEIGHT_NAMES}"
         )
-    for required_name in (POSE_CONFIG_NAME, POSE_WEIGHT_NAME):
-        if not (adapter_path / required_name).is_file():
-            raise FileNotFoundError(f"Required pose adapter sidecar missing: {adapter_path / required_name}")
+    if experiment == ALIGNED_EXPERIMENT:
+        if len(lora_files) != 1 or lora_files[0].suffix != ".safetensors":
+            raise ValueError("Aligned adapter requires one safetensors LoRA weight file")
+        for forbidden_name in (POSE_CONFIG_NAME, POSE_WEIGHT_NAME):
+            if (adapter_path / forbidden_name).exists():
+                raise ValueError(f"Aligned adapter must not contain a pose adapter: {adapter_path / forbidden_name}")
+        config_path = adapter_path / ALIGNED_ADAPTER_CONFIG_NAME
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Aligned adapter config missing: {config_path}")
+        config = _read_json_object(config_path)
+        expected = {
+            "experiment": ALIGNED_EXPERIMENT,
+            "reference_image_size": 224,
+            "target_image_size": 448,
+            "lora_rank": 8,
+            "lora_alpha": 8,
+            "lora_dropout": 0.0,
+            "pose_conditioning": "text_only",
+        }
+        for key, value in expected.items():
+            if config.get(key) != value:
+                raise ValueError(f"Aligned adapter config {key} must be {value!r}, got {config.get(key)!r}")
+        if set(config.get("target_modules", ())) != {"to_k", "to_q", "to_v", "to_out.0"}:
+            raise ValueError("Aligned adapter must target attention projections only")
+        contract = config.get("contract_identity")
+        if not isinstance(contract, Mapping) or contract.get("profile") != ALIGNED_EXPERIMENT:
+            raise ValueError("Aligned adapter is missing its training contract identity")
+        fingerprint = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+        if config.get("config_fingerprint") != fingerprint:
+            raise ValueError("Aligned adapter training contract fingerprint is inconsistent")
+        model_revision = contract.get("base_sources", {}).get("pretrained_model_path", {}).get("revision")
+        required_paths = [config_path]
+    else:
+        required_paths = [adapter_path / POSE_CONFIG_NAME, adapter_path / POSE_WEIGHT_NAME]
+        for path in required_paths:
+            if not path.is_file():
+                raise FileNotFoundError(f"Required pose adapter sidecar missing: {path}")
 
     adapter_hashes = {
         path.name: _sha256_file(path)
-        for path in [*lora_files, adapter_path / POSE_CONFIG_NAME, adapter_path / POSE_WEIGHT_NAME]
+        for path in [*lora_files, *required_paths]
     }
     model_path = Path(model_path_value).expanduser()
     model_config_hashes: dict[str, str] = {}
@@ -488,13 +545,71 @@ def _checkpoint_provenance(model_path_value: str, adapter_path_value: str) -> di
             candidate = model_path / relative
             if candidate.is_file():
                 model_config_hashes[relative] = _sha256_file(candidate)
+    model_weight_hashes: dict[str, str] = {}
+    if experiment == ALIGNED_EXPERIMENT and model_path.is_dir():
+        for candidate in sorted(model_path.rglob("*")):
+            if candidate.is_file() and candidate.suffix in (".safetensors", ".bin"):
+                model_weight_hashes[candidate.relative_to(model_path).as_posix()] = _sha256_file(candidate)
+        if not model_weight_hashes:
+            raise FileNotFoundError(f"Aligned local model has no weight files: {model_path}")
 
-    return {
+    provenance = {
         "model_path": str(model_path.resolve()) if model_path.exists() else model_path_value,
         "model_config_sha256": model_config_hashes,
         "adapter_path": str(adapter_path),
         "adapter_asset_sha256": adapter_hashes,
     }
+    if experiment == ALIGNED_EXPERIMENT:
+        provenance.update(
+            model_revision=model_revision,
+            model_weight_sha256=model_weight_hashes,
+            aligned_adapter=config,
+            experiment=experiment,
+        )
+    return provenance
+
+
+def _validated_aligned_sources(args: argparse.Namespace, adapter_config: Mapping[str, Any]) -> dict[str, Path]:
+    """Match all inference bases to the checkpoint's official cached commits."""
+    from huggingface_hub import snapshot_download
+
+    contract = adapter_config.get("contract_identity")
+    if not isinstance(contract, Mapping):
+        raise ValueError("Aligned adapter is missing its training contract identity")
+    sources = contract.get("base_sources")
+    if not isinstance(sources, Mapping):
+        raise ValueError("Aligned adapter is missing base source identities")
+    requested = {
+        "pretrained_model_path": (args.model_path, "OmniGen2/OmniGen2"),
+        "pretrained_vae_model_name_or_path": (
+            getattr(args, "vae_model_path", DEFAULT_VAE_MODEL_PATH), DEFAULT_VAE_MODEL_PATH
+        ),
+        "pretrained_text_encoder_model_name_or_path": (
+            getattr(args, "text_encoder_model_path", DEFAULT_TEXT_ENCODER_MODEL_PATH),
+            DEFAULT_TEXT_ENCODER_MODEL_PATH,
+        ),
+    }
+    resolved = {}
+    for key, (value, official_id) in requested.items():
+        source = sources.get(key)
+        if not isinstance(source, Mapping) or source.get("repo_id") != official_id:
+            raise ValueError(f"Aligned adapter {key} is not the official {official_id} base")
+        revision = source.get("revision")
+        if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            raise ValueError(f"Aligned adapter {key} has no immutable revision")
+        path = Path(value).expanduser()
+        if path.is_dir():
+            snapshot = path.resolve()
+        elif value == official_id:
+            snapshot = Path(snapshot_download(
+                repo_id=official_id, revision=revision, local_files_only=True
+            )).resolve()
+        else:
+            raise ValueError(f"Aligned inference requires official {official_id} or its cached snapshot for {key}")
+        if snapshot.name != revision or snapshot.parent.name != "snapshots" or snapshot.parent.parent.name != "models--" + official_id.replace("/", "--"):
+            raise ValueError(f"Aligned inference {key} does not match checkpoint revision {revision}")
+        resolved[key] = snapshot
+    return resolved
 
 
 def _derive_sample_seed(base_seed: int, task: str, sample_id: str) -> int:
@@ -536,12 +651,15 @@ def _make_task_plan(
     inference_radar_cache: dict[str, Any] | None = None,
 ) -> TaskPlan:
     split_name, _ = SPLITS[task]
+    aligned = getattr(args, "experiment", LEGACY_EXPERIMENT) == ALIGNED_EXPERIMENT
     dataset_options = {
         "data_root": Path(args.data_root).expanduser().resolve(),
         "split": split_name,
         "use_chat_template": False,
         "load_target": False,
     }
+    if aligned:
+        dataset_options.update(reference_image_size=224, target_image_size=448)
     if inference_radar_cache is not None:
         dataset_options["inference_radar_cache"] = inference_radar_cache
     dataset = dataset_class(**dataset_options)
@@ -558,6 +676,19 @@ def _make_task_plan(
 
     data_root = Path(args.data_root).expanduser().resolve()
     protocol_hashes, radar_hashes = _dataset_hashes(dataset, data_root, task, map_order)
+    if aligned:
+        contract = checkpoint["aligned_adapter"]["contract_identity"]
+        if Path(contract.get("data_root", "")).resolve() != data_root:
+            raise ValueError("Aligned inference data root differs from the training contract")
+        contract_files = contract.get("contract_files")
+        if not isinstance(contract_files, Mapping):
+            raise ValueError("Aligned adapter is missing protocol file hashes")
+        for relative in (
+            "benchmark_manifest.json", "minimal_dataset_report.json",
+            "calibration/z_calibration.json",
+        ):
+            if contract_files.get(relative) != protocol_hashes[relative]:
+                raise ValueError(f"Aligned inference protocol asset differs from training: {relative}")
     maps_in_order = list(dict.fromkeys(identity.map_name for identity in identities))
     sample_sequence = "\n".join(sample_ids).encode("utf-8")
     base_manifest = {
@@ -605,8 +736,8 @@ def _make_task_plan(
         "image": {
             "width": IMAGE_SIZE,
             "height": IMAGE_SIZE,
-            "radar_width": IMAGE_SIZE,
-            "radar_height": IMAGE_SIZE,
+            "radar_width": 224 if aligned else IMAGE_SIZE,
+            "radar_height": 224 if aligned else IMAGE_SIZE,
             "mode": "RGB",
             "format": "JPEG",
             "encoder": "Pillow default JPEG settings",
@@ -618,6 +749,8 @@ def _make_task_plan(
         "smoke": args.max_samples is not None,
         "max_samples": args.max_samples,
     }
+    if aligned:
+        base_manifest["experiment"] = ALIGNED_EXPERIMENT
     return TaskPlan(
         task=task,
         split=split_name,
@@ -701,10 +834,35 @@ def _validate_complete_manifest(plan: TaskPlan, args: argparse.Namespace) -> boo
 def _prepare_partial_resume(plan: TaskPlan) -> None:
     pending_path = plan.pending_manifest_path
     if pending_path.exists():
-        if pending_path.is_symlink() or _read_json_object(pending_path) != plan.base_manifest:
-            raise FileExistsError(
-                f"Existing partial inference marker differs from this run; refusing to mix outputs: {pending_path}"
-            )
+        if pending_path.is_symlink():
+            raise FileExistsError(f"Refusing to follow symlinked partial inference marker: {pending_path}")
+        existing_pending = _read_json_object(pending_path)
+        if existing_pending != plan.base_manifest:
+            old_hash = existing_pending.get("inference_script_sha256")
+            previous_without_script = {
+                key: value for key, value in existing_pending.items()
+                if key != "inference_script_sha256"
+            }
+            current_without_script = {
+                key: value for key, value in plan.base_manifest.items()
+                if key != "inference_script_sha256"
+            }
+            if (
+                not isinstance(old_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", old_hash) is None
+                or previous_without_script != current_without_script
+                or _all_jpeg_outputs(plan.task_root)
+            ):
+                raise FileExistsError(
+                    f"Existing partial inference marker differs from this run; refusing to mix outputs: {pending_path}"
+                )
+            archive = pending_path.with_name(f".inference_manifest.pending.{old_hash}.superseded.json")
+            _reject_symlink_path(archive)
+            if archive.exists():
+                raise FileExistsError(f"Refusing to replace archived partial inference marker: {archive}")
+            pending_path.rename(archive)
+            _fsync_directory(pending_path.parent)
+            _atomic_create_json(pending_path, plan.base_manifest)
     else:
         existing = _all_jpeg_outputs(plan.task_root)
         if existing:
@@ -746,21 +904,60 @@ def _load_pipeline(args: argparse.Namespace):
     if device.type == "cpu" and weight_dtype == torch.float16:
         raise ValueError("CPU inference with fp16 is unsupported; use --dtype fp32 or bf16")
 
+    aligned = getattr(args, "experiment", LEGACY_EXPERIMENT) == ALIGNED_EXPERIMENT
+    sources = getattr(args, "aligned_sources", None)
+    if aligned and not isinstance(sources, Mapping):
+        raise ValueError("Aligned base sources must be validated before model loading")
     transformer = OmniGen2Transformer2DModel.from_pretrained(
-        args.model_path,
-        subfolder="transformer",
-        torch_dtype=weight_dtype,
+        str(sources["pretrained_model_path"]) if aligned else args.model_path,
+        subfolder="transformer", torch_dtype=weight_dtype,
     )
-    load_pose_adapter(transformer, args.adapter_path)
-    pipeline = OmniGen2Pipeline.from_pretrained(
-        args.model_path,
-        transformer=transformer,
-        torch_dtype=weight_dtype,
-        trust_remote_code=True,
-    )
-    # The converted directory contains both LoRA weights and the independent
-    # pose-adapter sidecar; the adapter is loaded once and shared by both tasks.
-    pipeline.load_lora_weights(args.adapter_path)
+    if aligned:
+        if bool(getattr(transformer.config, "pose_conditioning", False)) or getattr(transformer, "pose_adapter", None) is not None:
+            raise ValueError("Aligned experiment requires a base Transformer without numeric pose conditioning")
+    else:
+        load_pose_adapter(transformer, args.adapter_path)
+    if aligned:
+        from diffusers import AutoencoderKL
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        from omnigen2.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+
+        vae = AutoencoderKL.from_pretrained(
+            str(sources["pretrained_vae_model_name_or_path"]),
+            subfolder="vae", torch_dtype=weight_dtype,
+        )
+        text_source = str(sources["pretrained_text_encoder_model_name_or_path"])
+        mllm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            text_source, torch_dtype=weight_dtype,
+        )
+        processor = AutoProcessor.from_pretrained(text_source, use_fast=False)
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            str(sources["pretrained_model_path"]), subfolder="scheduler"
+        )
+        pipeline = OmniGen2Pipeline(
+            transformer=transformer, vae=vae, scheduler=scheduler,
+            mllm=mllm, processor=processor,
+        )
+    else:
+        pipeline = OmniGen2Pipeline.from_pretrained(
+            args.model_path,
+            transformer=transformer,
+            torch_dtype=weight_dtype,
+            trust_remote_code=True,
+        )
+    # The adapter is loaded once and shared by both tasks. Diffusers cannot
+    # guess the filename in offline mode, so pin the aligned local asset.
+    if aligned:
+        adapter_file = Path(args.adapter_path) / "pytorch_lora_weights.safetensors"
+        if not adapter_file.is_file():
+            raise FileNotFoundError(f"Aligned LoRA weights missing: {adapter_file}")
+        pipeline.load_lora_weights(
+            args.adapter_path,
+            weight_name=adapter_file.name,
+            local_files_only=True,
+        )
+    else:
+        pipeline.load_lora_weights(args.adapter_path)
 
     if getattr(args, "fuse_lora", True):
         fuse_lora = getattr(pipeline, "fuse_lora", None)
@@ -795,6 +992,28 @@ def _pipeline_generator_device(pipeline: Any):
     return device
 
 
+def _aligned_empty_negative_prompt(pipeline: Any, batch_size: int, device: Any):
+    """Encode the training branch's exact dropped-text chat template once."""
+    from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Dataset
+
+    cached = getattr(pipeline, "_aligned_empty_negative_prompt_cache", None)
+    cache_key = (str(device), str(pipeline.mllm.dtype), 888)
+    if cached is None or cached[0] != cache_key:
+        messages = [
+            {"role": "system", "content": CSGOSeen10Dataset.SYSTEM_PROMPT_DROP},
+            {"role": "user", "content": ""},
+        ]
+        formatted = pipeline.processor.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        embeddings, mask = pipeline._get_qwen2_prompt_embeds(
+            prompt=[formatted], device=device, max_sequence_length=888
+        )
+        cached = (cache_key, embeddings.detach(), mask.detach())
+        pipeline._aligned_empty_negative_prompt_cache = cached
+    return cached[1].expand(batch_size, -1, -1), cached[2].expand(batch_size, -1)
+
+
 def _generate_batch(
     pipeline: Any,
     identities: list[SampleIdentity],
@@ -804,6 +1023,7 @@ def _generate_batch(
     base_seed: int,
     steps: int,
     vae_decode_batch_size: int,
+    experiment: str = LEGACY_EXPERIMENT,
 ):
     import torch
 
@@ -825,7 +1045,7 @@ def _generate_batch(
     ]
     prompts = [sample[0] for sample in inference_inputs]
     radar_images_by_sample = [sample[1] for sample in inference_inputs]
-    pose_values = torch.cat([sample[2] for sample in inference_inputs], dim=0)
+    aligned = experiment == ALIGNED_EXPERIMENT
     # The existing pipeline wraps the one-sample image list internally. Keep
     # that B1 contract for tail and OOM-retry batches; larger batches use one
     # radar-image list per prompt.
@@ -835,16 +1055,14 @@ def _generate_batch(
     if len(identities) > 1:
         image_cache_keys = [[map_name] for map_name in image_cache_keys]
 
-    with torch.inference_mode():
-        result = pipeline(
+    call_kwargs = dict(
             prompt=prompts,
             input_images=input_images,
-            pose_values=pose_values,
             width=IMAGE_SIZE,
             height=IMAGE_SIZE,
             align_res=False,
             max_pixels=IMAGE_SIZE * IMAGE_SIZE,
-            max_input_image_side_length=IMAGE_SIZE,
+            max_input_image_side_length=224 if aligned else IMAGE_SIZE,
             num_inference_steps=steps,
             num_images_per_prompt=1,
             generator=noise_generators,
@@ -854,6 +1072,16 @@ def _generate_batch(
             output_type="pil",
             return_dict=True,
         )
+    if aligned:
+        call_kwargs["max_sequence_length"] = 888
+        with torch.inference_mode():
+            negative_embeds, negative_mask = _aligned_empty_negative_prompt(pipeline, len(identities), device)
+        call_kwargs["negative_prompt_embeds"] = negative_embeds
+        call_kwargs["negative_prompt_attention_mask"] = negative_mask
+    else:
+        call_kwargs["pose_values"] = torch.cat([sample[2] for sample in inference_inputs], dim=0)
+    with torch.inference_mode():
+        result = pipeline(**call_kwargs)
     images = getattr(result, "images", None)
     if not isinstance(images, (list, tuple)) or len(images) != len(identities):
         raise ValueError(
@@ -884,6 +1112,7 @@ def _generate_batch_with_fallback(
     steps: int,
     vae_decode_batch_size: int,
     oom_fallback: bool,
+    experiment: str = LEGACY_EXPERIMENT,
 ):
     if not identities or len(identities) != len(inference_inputs):
         raise ValueError("A generation batch must contain matching non-empty identities and inputs")
@@ -908,6 +1137,7 @@ def _generate_batch_with_fallback(
                 base_seed=base_seed,
                 steps=steps,
                 vae_decode_batch_size=vae_decode_batch_size,
+                experiment=experiment,
             )
         except Exception as error:
             if (
@@ -995,6 +1225,7 @@ def _run_task(
                 steps=args.num_inference_steps,
                 vae_decode_batch_size=vae_decode_batch_size,
                 oom_fallback=oom_fallback,
+                experiment=getattr(args, "experiment", LEGACY_EXPERIMENT),
             )
             generated_images = generation_result.images
             if generation_result.had_oom_fallback:
@@ -1045,16 +1276,26 @@ def main(args: argparse.Namespace) -> None:
     output_root = (
         Path(args.output_root).expanduser().resolve()
         if args.output_root is not None
-        else STANDARD_OUTPUT_ROOT / f"seed_{args.seed}"
+        else (
+            PROJECT_ROOT / "outputs" / ALIGNED_EXPERIMENT / "OmniGen2" / f"seed_{args.seed}"
+            if getattr(args, "experiment", LEGACY_EXPERIMENT) == ALIGNED_EXPERIMENT
+            else STANDARD_OUTPUT_ROOT / f"seed_{args.seed}"
+        )
     )
     data_root = Path(args.data_root).expanduser().resolve()
     if not data_root.is_dir():
         raise FileNotFoundError(f"--data-root is not a directory: {data_root}")
-
     from omnigen2.dataset.csgo_seen10_dataset import CSGOSeen10Dataset, SEEN_MAPS
 
     map_order = tuple(SEEN_MAPS)
-    checkpoint = _checkpoint_provenance(args.model_path, args.adapter_path)
+    checkpoint = _checkpoint_provenance(
+        args.model_path, args.adapter_path, getattr(args, "experiment", LEGACY_EXPERIMENT),
+    )
+    if getattr(args, "experiment", LEGACY_EXPERIMENT) == ALIGNED_EXPERIMENT:
+        adapter_config = checkpoint["aligned_adapter"]
+        if adapter_config.get("smoke") and args.max_samples is None:
+            raise ValueError("Smoke adapter requires --max-samples and an isolated smoke output root")
+        args.aligned_sources = _validated_aligned_sources(args, adapter_config)
     tasks = ("discrete", "continuous") if args.task == "all" else (args.task,)
     inference_radar_cache: dict[str, Any] = {}
     plans = [

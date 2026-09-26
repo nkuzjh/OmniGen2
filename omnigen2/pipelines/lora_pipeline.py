@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Mapping
 from typing import Callable, Dict, List, Optional, Union
 
 import torch
@@ -133,7 +134,7 @@ class OmniGen2LoraLoaderMixin(LoraBaseMixin):
             "framework": "pytorch",
         }
 
-        state_dict = _fetch_state_dict(
+        fetched = _fetch_state_dict(
             pretrained_model_name_or_path_or_dict=pretrained_model_name_or_path_or_dict,
             weight_name=weight_name,
             use_safetensors=use_safetensors,
@@ -147,6 +148,17 @@ class OmniGen2LoraLoaderMixin(LoraBaseMixin):
             user_agent=user_agent,
             allow_pickle=allow_pickle,
         )
+        # Diffusers 0.35 returns (state_dict, safetensors metadata), while
+        # older releases returned the state dict alone. This loader's public
+        # contract remains a state dict for load_lora_weights below.
+        if isinstance(fetched, tuple):
+            if len(fetched) != 2:
+                raise TypeError(f"Unexpected Diffusers LoRA loader result of length {len(fetched)}")
+            state_dict, _metadata = fetched
+        else:
+            state_dict = fetched
+        if not isinstance(state_dict, Mapping):
+            raise TypeError(f"Diffusers LoRA loader returned {type(state_dict).__name__}, expected a state dict")
 
         is_dora_scale_present = any("dora_scale" in k for k in state_dict)
         if is_dora_scale_present:

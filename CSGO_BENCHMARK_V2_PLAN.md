@@ -1,5 +1,9 @@
 # OmniGen2 → CSGO Benchmark v2 Seen-10 接入方案
 
+本文保留首次legacy接入及无compile推理加速的历史方案；“拟修改”“RUN_FULL=0”等是当时范围，
+不代表当前执行状态，也不覆盖后续aligned实验。当前运行说明见 [CSGO_SEEN10.md](CSGO_SEEN10.md)，
+aligned设计、配方来源和实施边界见 [CSGO_SEEN10_PLAN.md](CSGO_SEEN10_PLAN.md)。
+
 ## 范围与边界
 
 - 模型类型是 `GENERATION`，只接入 discrete generation 和 continuous generation，不新增 localization 头。
