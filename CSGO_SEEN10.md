@@ -109,131 +109,51 @@ legacy使用原生Accelerate checkpoint；其`late`在每次保存时更新，�
 
 ## 4. 新服务器初始化、官方权重与路径
 
-### 4.1 准备流程
+从 OmniGen2 项目根目录，在 Bash 终端中依次执行以下两组命令。适用于 Linux + NVIDIA GPU；数据和共享评测器需另行部署，FLUX.1-dev 需要已登录具有访问权限的 Hugging Face 账户。
 
-参考 ControlAR 的“环境 / 资产 / 路径检查”分工，新增独立脚本；不复制其模型、训练配方或编译推理。面向 **Linux + NVIDIA GPU**，不要求新服务器用户名、项目安装位置或 Conda 环境名相同。Git 不包含 Python 环境、模型权重、Benchmark 数据、共享评测器或历史输出；须分别准备，**不要直接复制旧服务器的 `.venv`**。
-
-从新服务器 OmniGen2 checkout 根目录执行。以下均为用户手动命令，本次实现没有安装环境或下载大权重：
+### 4.1 环境准备
 
 ```bash
-# 1. 只安装独立训练环境；默认项目 .venv，不影响 UniLIP/评测器。
 bash scripts/setup_csgo_seen10.sh --env-only
+```
 
-# 2. 官方基础权重。仅 aligned：约23.56 GB；需要legacy整套推理则用 --profile all。
-# FLUX.1-dev需先在HF接受访问条款，并使用有权限的账户登录。
-.venv/bin/hf auth login
-.venv/bin/python scripts/download_csgo_seen10_assets.py --profile aligned
+默认创建项目内独立 `.venv`，不下载权重；已有可用环境保留，不自动升级或降级。不要直接复制旧服务器的 `.venv`。新环境采用 Python3.11/3.12、PyTorch2.7.1 / torchvision0.22.1 cu128，其他直接依赖见 [requirements-csgo-seen10.txt](requirements-csgo-seen10.txt)。
 
-# 3. 显式绑定此次下载的固定revision，避免依赖HF可变/缺失的refs/main。
-# 此命令只打印并设置三个模型路径，不下载；在后续训练/推理使用的同一shell执行。
+### 4.2 权重下载
+
+**首次使用FLUX需先授权并登录一次，已有权限且服务器已登录可跳过。** 在浏览器登录 [FLUX.1-dev模型页面](https://huggingface.co/black-forest-labs/FLUX.1-dev)，阅读并接受条款，确认获得访问权限；再用同一账户到 [Token设置](https://huggingface.co/settings/tokens) 创建只读Token（`Read`，无需`Write`；细粒度Token需允许读取该受限模型）。
+
+在服务器项目根目录执行一次 `.venv/bin/hf auth login`，按提示粘贴Token；询问是否添加到Git credential时选`n`即可。不要将Token写进脚本、命令行参数或发到聊天中。完成后执行原下载命令：
+
+```bash
+.venv/bin/python scripts/download_csgo_seen10_assets.py --profile aligned && \
 source <(.venv/bin/python scripts/download_csgo_seen10_assets.py --print-env)
-
-# 4. 数据和共享评测器由用户另行部署；示例替换为目标机器真实位置。
-export CSGO_DATA_ROOT="/srv/datasets/csgo_benchmark_v2"
-export SHARED_EVAL_DIR="/srv/projects/csgo_benchmark_v2_eval_general"
-# 遵循共享评测器自己的README准备环境/指标资产；不要在OmniGen2里复制指标实现。
-bash "$SHARED_EVAL_DIR/setup_env.sh"
-
-# 5. 只读检查：不安装、不下载、不初始化CUDA、不创建run目录。
-bash scripts/setup_csgo_seen10.sh --check --profile aligned
-bash scripts/run_csgo_seen10.sh train --print-paths
-bash scripts/run_csgo_seen10.sh train \
-  --experiment csgo_seen10_exp32gen_aligned --print-paths
-bash scripts/run_csgo_seen10.sh eval \
-  --experiment csgo_seen10_exp32gen_aligned --print-paths
-
-# 6. 在目标GPU节点显式验证CUDA；仅8×8 BF16矩阵，不载模型、不启动训练。
-bash scripts/setup_csgo_seen10.sh --check-cuda
 ```
 
-若只查看安装方式，运行 `bash scripts/setup_csgo_seen10.sh --help`。不加参数的 setup 是**安装环境 + 下载/检查 all 资产**，不是只读操作；`--env-only` 跳过资产，`--check --env-only` 仅检查环境。对既有完整环境只读检查、不执行 pip，不升级或降级；既有目录非环境或依赖不完整时保留原样并报错，显式选择另一目录：
+下载 aligned 所需的 OmniGen2、Qwen 和 FLUX VAE 官方固定版本，约23.56 GB；脚本自动复用并校验缓存。下载成功后，第二行设置当前终端的三个模型路径，避免依赖可变或缺失的HF `refs/main`。**后续训练、推理在同一终端执行**；新终端需重新设置这些变量，也可重复执行上述命令，完整缓存不会重复下载。
 
-```bash
-export OMNIGEN2_PYTHON="$PWD/.venv-csgo-seen10/bin/python"
-OMNIGEN2_BOOTSTRAP_PYTHON=/path/to/python3.11 \
-  bash scripts/setup_csgo_seen10.sh --env-only
-# 自定义环境时，下文所有 .venv/bin/python 改用 "$OMNIGEN2_PYTHON"。
-```
+若报`GatedRepoError`，先确认网页授权与服务器Token属于同一账户、Token具有读取权限；已设置的旧`HF_TOKEN`会覆盖本地登录凭证。解决授权后保留原缓存目录，重跑上述下载命令即可复用已下载文件，无需重装环境或另外执行检查命令。
 
-fresh 安装选 Python3.11/3.12；找不到合适解释器时尝试 Conda 创建隔离 Python3.11。可用 `OMNIGEN2_BOOTSTRAP_PYTHON` / `OMNIGEN2_CONDA_EXE` 显式指定。新环境使用 PyTorch2.7.1 + torchvision0.22.1 的 cu128 配对，依据 [PyTorch官方版本表](https://pytorch.org/get-started/previous-versions/)，与 ControlAR 的新机环境后端一致；这不改变 OmniGen2 官方 LoRA/优化配方。其他直接依赖固定在 `requirements-csgo-seen10.txt`，原始 `requirements.txt` 保留不改。不是所有传递依赖的带哈希锁文件；新安装会记录实际安装版本。FlashAttention、xformers、bitsandbytes、torchaudio不作为必需依赖。
+若需要 legacy 的整套原生推理pipeline，将下载参数改为 `--profile all`，总计约38.93 GB。固定revision和文件清单见 [scripts/csgo_seen10_assets.json](scripts/csgo_seen10_assets.json)；不会从旧CSGO checkpoint初始化。
 
-`OMNIGEN2_TORCH_BACKEND=cpu` 仅供 CPU 环境检查；实际训练/推理需要兼容驱动、BF16 GPU 与原生 Triton。GPU内核/显存是否适合仍需目标机器的 `--check-cuda` 和第7节独立 smoke；CPU导入成功不等于新机器的真实模型验收。**尚未在另一台服务器完成 fresh 安装及 GPU smoke**，不承诺跨 GPU/库版本逐位一致。
+### 4.3 必要说明
 
-### 4.2 官方基础资产与离线缓存
+完成首次HF授权和登录后，日常准备仍只需上述两组主命令，不再要求逐项执行环境、资产、路径或CUDA检查命令；脚本自身的必要校验仍保留，出错时再按提示排查。
 
-aligned 从官方原始基础权重开始，固定清单 `scripts/csgo_seen10_assets.json` 使用与此前验收一致的revision；文件大小、LFS SHA256 / Git blob SHA1 来自官方 HF 固定提交的文件元数据。
+新服务器目录不同时，通过以下环境变量指定；未设置时保留本机兼容默认，新机器可回退到项目同级的数据/评测器目录。
 
-| 用途 | 官方仓库 | 固定revision |
-| --- | --- | --- |
-| 生成Transformer / Euler scheduler | `OmniGen2/OmniGen2` | `df5dca8a981d74e6c3af214c145f5c735fe72367` |
-| Qwen文本模型 / tokenizer / processor | `Qwen/Qwen2.5-VL-3B-Instruct` | `66285546d2b821cf421d4f5eb2576359d3770cd3` |
-| VAE | `black-forest-labs/FLUX.1-dev` 的 `vae/` | `3de623fc3c33e44ffbe2bad470d0f45bccf2eb21` |
-
-| 资产profile | 文件数 / 清单大小 | 覆盖范围 |
-| --- | --- | --- |
-| `aligned` | 19 / 23.56 GB | 三份官方组件；aligned训练和推理，也覆盖legacy训练需要的基础组件 |
-| `legacy` 或 `all`（默认） | 38 / 38.93 GB | 以上加OmniGen2 bundled mllm、processor、VAE等，供legacy完整pipeline推理 |
-
-只下载FLUX的VAE，不下载其完整生成模型。容量不含Python环境、数据、输出及下载临时余量。下载调用 [HF官方缓存接口](https://huggingface.co/docs/huggingface_hub/guides/download)，按不可变commit逐文件获取、复用已有有效缓存；支持Hub未完成文件的续传。已有文件大小/hash不匹配时拒绝覆盖，要求排查或换独立cache；不会改写 `refs/main`、CSGO checkpoint或正在运行任务的权重。
-
-```bash
-# 仅查看文件清单和容量，不联网、不读大权重、不写文件：
-python3 scripts/download_csgo_seen10_assets.py --dry-run --profile aligned
-# 独立执行离线完整字节/hash检查；缺失或损坏返回非0。
-python3 scripts/download_csgo_seen10_assets.py --check --profile aligned
-# 缓存可迁移到大容量磁盘；所有后续命令使用相同环境变量。
-export HF_HUB_CACHE="/srv/cache/huggingface/hub"
-.venv/bin/python scripts/download_csgo_seen10_assets.py --profile aligned
-source <(python3 scripts/download_csgo_seen10_assets.py --print-env)
-```
-
-缓存选择：`--cache-dir` > `HF_HUB_CACHE` > `HUGGINGFACE_HUB_CACHE` > `HF_HOME/hub` > `XDG_CACHE_HOME/huggingface/hub`（默认用户 `~/.cache/huggingface/hub`）。`--print-env`输出shell安全引用的三个snapshot路径，本身不是完整性证明；先用 `--check` 核对。`OMNIGEN2_MODEL_PATH`、`OMNIGEN2_VAE_MODEL_PATH`、`OMNIGEN2_TEXT_ENCODER_MODEL_PATH`继续支持手动覆盖；本地路径建议绝对路径。
-
-离线转运HF缓存时保留 `models--.../snapshots/<revision>` 与 `blobs/` 及相对符号链接，不能只复制指向缺失blob的snapshot目录。aligned只接受官方repo ID或能核实repo/revision身份的HF snapshot，不能任意重命名为普通模型目录。下载固定revision不保证 `refs/main` 存在，因此新服务器应执行上述 `--print-env` 绑定，不能仅下载后依赖默认repo ID。不会自动将当前机器的旧CSGO模型当成基础权重。
-
-三个模型变量都传给训练及aligned推理；legacy推理只从 `OMNIGEN2_MODEL_PATH` 加载完整pipeline，不另用外置Qwen/FLUX。**aligned资产齐全不等于legacy整套推理已就绪**。`--check`核对的是固定官方清单，不验证用户任意自定义模型目录。
-
-下载器和wrapper默认 `HF_HUB_DISABLE_XET=1`、download timeout120、etag timeout30；支持显式HF环境变量、`HF_ENDPOINT`与已授权HF凭证。FLUX访问被拒绝时应先完成授权，不绕过门禁、不在脚本或文档中存储token。项目内历史 `pretrained_models/OmniGen2-ms` 尚有7个 `.aria2` sidecar，不能当作完整已验收模型。
-
-### 4.3 服务器路径与旧命令兼容
-
-新wrapper参数：`--data-root PATH`、`--eval-root PATH`、`--eval-python PATH`（别名 `--unilip-python`）、`--print-paths`。两种profile均支持；未传新参数时保留当前机器默认。相对机器路径锚定项目根目录，不跟随启动命令的cwd；Python路径不会穿透 `bin/python` symlink，保留venv身份。
-
-| 用途 | 选择规则（从高到低） |
+| 配置 | 环境变量 |
 | --- | --- |
-| 训练/推理Python | `OMNIGEN2_PYTHON` > checkout内 `.venv/bin/python` |
-| 数据 | CLI `--data-root` > `CSGO_DATA_ROOT` > `CSGO_BENCHMARK_V2_DATA` > `DATA_ROOT` > 配置自定义路径 > 已存在的旧默认 > checkout同级 `UniLIP/data/csgo_benchmark_v2` |
-| 共享评测器 | CLI `--eval-root` > `SHARED_EVAL_DIR` > `CSGO_EVAL_ROOT` > 已存在旧默认 > checkout同级 `csgo_benchmark_v2_eval_general` |
-| 评测Python | CLI `--eval-python/--unilip-python` > **所选共享评测器** `.venv/bin/python` > `EVAL_PYTHON` > `UNILIP_PYTHON` > 旧UniLIP Python |
+| Benchmark数据根目录 | `CSGO_DATA_ROOT` |
+| 共享评测器根目录 | `SHARED_EVAL_DIR` |
+| HF权重缓存目录 | `HF_HUB_CACHE`（默认用户 `~/.cache/huggingface/hub`） |
+| 自定义训练环境Python | `OMNIGEN2_PYTHON`（默认项目 `.venv/bin/python`） |
 
-旧数据、评测器、评测Python默认分别为 `/home/jiahao/task/UniLIP/data/csgo_benchmark_v2`、`/home/jiahao/task/csgo_benchmark_v2_eval_general`、`/home/jiahao/miniconda3/envs/UniLIP/bin/python`。显式设置不存在路径时报告错误，**不静默换到其他数据/评测器**。自动使用共享评测器自己的venv是本次新增规则；若需强制复现历史评测环境，用 `--eval-python` 指明，并核对共享评测器的指标配置/版本。
+使用自定义Python时，将权重命令中的 `.venv/bin/python` 替换为该解释器。评测默认优先使用所选共享评测器自己的 `.venv/bin/python`，需强制指定时使用 `--eval-python`；不把训练环境当作评测环境兜底。
 
-`--print-paths`只需标准库解释器，报告来源、exists、ready，允许在训练环境、数据或评测环境尚未安装时运行；返回0仅表示检查命令执行成功，**不是所有路径ready，也不是数据协议/指标资产检查通过**。wrapper对配置仅支持现有的简单`data.data_root`标量；自定义YAML若使用anchor、插值或flow等复杂表示，会明确拒绝，需用`--data-root`/环境变量指定（直接训练入口仍由OmegaConf读取配置）。训练/推理不要求评测Python存在；正式eval以及legacy含评测的smoke仍严格检查共享评测器。aligned `--dry-run`继续只打印命令。
+数据应保留发布的manifest、split、selection、calibration和图片相对布局；共享评测器按其自身README准备。旧训练/推理命令、实验配方和输出隔离保持不变。本次能力用于新机器从官方基座初始化，**不自动迁移或改写旧checkpoint的恢复合同**。
 
-```bash
-# 路径覆盖示例；依旧是检查，不启动正式实验。
-bash scripts/run_csgo_seen10.sh train \
-  --experiment csgo_seen10_exp32gen_aligned \
-  --data-root "/srv/datasets/csgo_benchmark_v2" \
-  --eval-root "/srv/projects/csgo_benchmark_v2_eval_general" \
-  --print-paths
-bash scripts/run_csgo_seen10.sh train \
-  --experiment csgo_seen10_exp32gen_aligned \
-  --num-processes 4 --micro-batch-size 4 --gradient-accumulation-steps 8 \
-  --dry-run
-```
-
-数据须完整迁移发布的manifest、selection、split、calibration、radars、images，保持相对布局及文件内容，不重新扫描拆split。路径就绪后执行第7节数据审计，不能用目录存在代替协议检查。
-
-训练进程数仍为 `NUM_PROCESSES`（aligned另有 `--num-processes`）；只校验 world×micro×accumulation=128。正式seed42和checkout内独立aligned root不变。推理默认batch16、decode1，原有batch/缓存/fuse/OOM开关不变，不启用compile。
-
-本次提供**新服务器从官方基座初始化、重新开独立实验**的能力，不自动迁移旧checkpoint合同。aligned恢复仍严格检查data/base绝对路径、代码和配置身份；拷贝checkpoint换盘后可能被拒绝，不能手改metadata/指纹绕过。预测目录也有身份校验，不续写其他机器/旧checkpoint的不完整输出。跨机器迁移精确resume需另行审计批准，跨GPU/库版本不承诺逐位一致。
-
-### 4.4 本机历史环境与本次验收边界
-
-2026-09-27此前GPU验收环境为Python3.13.11；项目 `.venv` 中Transformers4.51.3、Diffusers0.35.2、PEFT0.17.1；继承Miniconda的PyTorch2.12.0、Accelerate1.11.0、OmegaConf2.3.0，CUDA13、RTX PRO6000 Blackwell96GB。这是**混合site-packages历史环境**，不是fresh安装配方。新的只读检查会警告系统包继承及Python版本差异，但不替换该环境。原先 `venv --system-site-packages` 的本机准备方式不再推荐用于新服务器。
-
-本次新机能力验证采用隔离mock/路径与命令回归、当前环境只读检查和已有资产hash检查；未安装新环境、未下载权重、未修改共享评测器、未执行新GPU smoke或正式训练/推理。具体测试数与当前缺失项见第8节新增记录；此前真实两步训练/恢复证据仍以历史 [验收报告](CSGO_ALIGNED_VALIDATION.md)为准。
+尚未在另一台服务器完成实际安装和GPU smoke，不承诺跨机器逐位一致。此前本机混合环境及验证结果保留在第8节和 [CSGO_ALIGNED_VALIDATION.md](CSGO_ALIGNED_VALIDATION.md)，不作为新增的日常操作步骤。
 
 ## 5. 手动训练、恢复、推理和评测
 
@@ -443,6 +363,6 @@ aligned验收摘要（详见 [CSGO_ALIGNED_VALIDATION.md](CSGO_ALIGNED_VALIDATIO
 | aligned 4卡×micro4×accum8 `--dry-run` | 正确生成DDP启动命令，有效batch128；未启动GPU作业 |
 | 兼容/隔离 | 两份CSGO配置、原requirements及严格训练源码指纹覆盖文件与本次修改前一致；mock验证缺失/损坏资产拒绝、现有环境保护、含空格/非cwd/显式坏路径和配置路径优先级；`bash -n`、`git diff --check`通过 |
 
-Qwen缺失项属于本次固定完整清单中的生成配置元数据，不代表18项已通过hash的文件损坏，也不推翻此前GPU smoke记录。用户可按第4节下载命令手动补齐，再运行`--check`。未对legacy/all全部大权重另做完整hash验收，不把aligned结果泛化为legacy资产就绪。
+Qwen缺失项属于本次固定完整清单中的生成配置元数据，不代表18项已通过hash的文件损坏，也不推翻此前GPU smoke记录。用户可按第4节下载命令手动补齐，下载脚本会自动校验，无需再单独执行检查命令。未对legacy/all全部大权重另做完整hash验收，不把aligned结果泛化为legacy资产就绪。
 
-未实际执行新环境pip/Conda安装、远端服务器GPU检查、真实模型短训/推理或全量评测；没有停止已有ControlAR/OpenPI任务、改写checkpoint、覆盖预测或创建正式aligned run。目标机器仍须完成第4节安装/CUDA检查及第7节独立smoke，之后由用户决定正式启动。
+未实际执行新环境pip/Conda安装、远端服务器GPU检查、真实模型短训/推理或全量评测；没有停止已有ControlAR/OpenPI任务、改写checkpoint、覆盖预测或创建正式aligned run。新服务器日常准备按第4节两组命令执行；第7节保留独立smoke方法，供需要时验收，不计入环境准备步骤。正式启动由用户决定。
