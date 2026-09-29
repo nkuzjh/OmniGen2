@@ -91,8 +91,9 @@ prepare the environment, then download official weights and set their paths in
 the same shell. Routine setup does not require a separate checklist of commands.
 First-time FLUX access requires accepting the model terms and a one-time HF login;
 the same section explains both without adding routine verification commands.
-This separate bootstrap preserves existing environments and does not change the
-official instructions below or the legacy/aligned experiment recipes.
+Re-running environment setup repairs missing dependencies while preserving installed
+direct/core versions. It does not change the official instructions below or the
+legacy/aligned experiment recipes.
 
 ### 🛠️ Environment Setup
 

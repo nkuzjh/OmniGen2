@@ -7,23 +7,52 @@ import argparse
 import importlib
 import importlib.metadata as metadata
 import os
+import re
 import sys
 from pathlib import Path
 
 
-REQUIRED_DISTRIBUTIONS = (
-    "torch", "torchvision", "numpy", "Pillow", "einops", "timm",
-    "accelerate", "transformers", "diffusers", "peft", "huggingface-hub",
-    "tokenizers", "safetensors", "omegaconf", "torchdiffeq",
-    "python-dotenv", "matplotlib", "scipy", "tqdm",
-)
-REQUIRED_MODULES = (
-    "torch", "torchvision", "numpy", "PIL", "einops", "timm",
-    "accelerate", "transformers", "diffusers", "peft", "huggingface_hub",
-    "tokenizers", "safetensors", "omegaconf", "torchdiffeq",
-    "dotenv", "matplotlib", "scipy", "tqdm",
-)
-OPTIONAL_MODULES = ("cv2", "wandb")
+REQUIREMENTS = Path(__file__).resolve().parents[1] / "requirements-csgo-seen10.txt"
+# The requirements file is authoritative. Every declared direct dependency must
+# have an import probe; adding a package cannot silently bypass this check.
+DISTRIBUTION_MODULES = {
+    "torch": "torch", "torchvision": "torchvision", "numpy": "numpy",
+    "pillow": "PIL", "einops": "einops", "timm": "timm",
+    "accelerate": "accelerate", "transformers": "transformers",
+    "diffusers": "diffusers", "peft": "peft", "huggingface-hub": "huggingface_hub",
+    "datasets": "datasets", "tokenizers": "tokenizers", "safetensors": "safetensors",
+    "omegaconf": "omegaconf", "pyyaml": "yaml", "packaging": "packaging",
+    "opencv-python-headless": "cv2", "scipy": "scipy", "torchdiffeq": "torchdiffeq",
+    "wandb": "wandb", "tensorboard": "tensorboard", "matplotlib": "matplotlib",
+    "tqdm": "tqdm", "python-dotenv": "dotenv", "ninja": "ninja",
+    "wheel": "wheel", "pytest": "pytest",
+}
+REQUIRED_SYMBOLS = {
+    "datasets": ("load_dataset", "concatenate_datasets"),
+    "transformers": ("AutoTokenizer", "AutoProcessor", "Qwen2_5_VLModel", "Qwen2_5_VLForConditionalGeneration"),
+    "torch.utils.tensorboard": ("SummaryWriter",),
+    "accelerate": ("Accelerator", "init_empty_weights"),
+    "diffusers": ("AutoencoderKL", "FlowMatchEulerDiscreteScheduler"),
+    "peft": ("LoraConfig", "get_peft_model_state_dict", "set_peft_model_state_dict"),
+    "huggingface_hub": ("hf_hub_download", "snapshot_download"),
+}
+
+
+def requirement_pins(path: Path = REQUIREMENTS) -> dict[str, str]:
+    pins = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^\s;]+)", line)
+        if not match:
+            raise ValueError(f"Expected an exact dependency pin in {path}: {line}")
+        name, version = match.groups()
+        canonical = re.sub(r"[-_.]+", "-", name).lower()
+        if canonical in pins:
+            raise ValueError(f"Duplicate dependency: {name}")
+        pins[canonical] = version
+    return pins
 
 
 def environment_identity(expected: Path) -> None:
@@ -36,51 +65,56 @@ def environment_identity(expected: Path) -> None:
             raise SystemExit(f"{expected} is not an active virtual environment")
         config = cfg.read_text(encoding="utf-8").lower()
         if "include-system-site-packages = true" in config:
-            print("WARNING: this venv inherits packages from its base Python; existing environment is read-only", file=sys.stderr)
+            print("WARNING: this venv inherits base packages; repairs must stay inside the selected venv and preserve core versions", file=sys.stderr)
         elif "include-system-site-packages = false" not in config:
             raise SystemExit(f"{cfg} has unknown package isolation; preserved unchanged")
     elif not (expected / "conda-meta").is_dir():
         raise SystemExit(f"{expected} is neither a venv nor a Conda environment; preserved unchanged")
 
 
-def check_imports(*, strict_extras: bool = False) -> None:
+def check_imports(*, strict_extras: bool = False, requirements: Path = REQUIREMENTS) -> None:
     # Optional integrations such as peft/DeepSpeed may probe CUDA at import.
     # Hide devices in this short-lived process so the CPU check stays CPU-only.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    pins = requirement_pins(requirements)
+    unmapped = set(pins) - DISTRIBUTION_MODULES.keys()
+    if unmapped:
+        raise SystemExit("Dependencies missing import probes: " + ", ".join(sorted(unmapped)))
     missing = []
-    for name in REQUIRED_DISTRIBUTIONS:
+    for name in pins:
         try:
             metadata.version(name)
         except metadata.PackageNotFoundError:
             missing.append(name)
     if missing:
-        raise SystemExit("Missing core distributions: " + ", ".join(missing))
+        raise SystemExit("Missing declared distributions: " + ", ".join(missing) +
+                         ". Run bash scripts/setup_csgo_seen10.sh --env-only to install all missing dependencies.")
     failures = []
-    for module in REQUIRED_MODULES:
+    for module in dict.fromkeys(DISTRIBUTION_MODULES[name] for name in pins):
         try:
             importlib.import_module(module)
         except Exception as exc:
             failures.append(f"{module}: {type(exc).__name__}: {exc}")
     if failures:
-        raise SystemExit("Core import failures:\n  " + "\n  ".join(failures))
-    try:
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel
-        _ = (AutoProcessor, Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel)
-    except Exception as exc:
-        raise SystemExit(f"Required Transformers Qwen2.5-VL classes unavailable: {type(exc).__name__}: {exc}") from exc
-    optional_failures = []
-    for module in OPTIONAL_MODULES:
+        raise SystemExit("Declared dependency import failures:\n  " + "\n  ".join(failures))
+    for module, symbols in REQUIRED_SYMBOLS.items():
         try:
-            importlib.import_module(module)
+            imported = importlib.import_module(module)
+            for symbol in symbols:
+                getattr(imported, symbol)
         except Exception as exc:
-            optional_failures.append(f"{module}: {type(exc).__name__}: {exc}")
-    if optional_failures:
-        message = "Optional import failures:\n  " + "\n  ".join(optional_failures)
-        if strict_extras:
-            raise SystemExit(message)
-        print("WARNING: " + message, file=sys.stderr)
+            failures.append(f"{module}: {type(exc).__name__}: {exc}")
+    if failures:
+        raise SystemExit("Required runtime interfaces unavailable:\n  " + "\n  ".join(failures))
     import torch
 
+    # CUDA wheels supply the matching Triton version through Torch dependencies.
+    # Do not import OmniGen2's native kernels here: their decorators probe a GPU.
+    if torch.version.cuda is not None and sys.platform == "linux":
+        try:
+            importlib.import_module("triton")
+        except ImportError as exc:
+            raise SystemExit("CUDA PyTorch requires its matching Triton dependency; rerun environment setup") from exc
     if torch.cuda.is_initialized():
         raise SystemExit("CUDA initialized during CPU-only import check")
     print(f"Environment: {sys.prefix} (Python {sys.version.split()[0]})")
@@ -107,12 +141,7 @@ def check_cuda() -> None:
 
 
 def check_fresh_pins(requirements: Path) -> None:
-    expected = {"torch": "2.7.1", "torchvision": "0.22.1"}
-    for raw in requirements.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if line and not line.startswith("#"):
-            name, version = line.split("==", 1)
-            expected[name] = version
+    expected = requirement_pins(requirements)
     mismatches = []
     for name, version in expected.items():
         try:
@@ -137,7 +166,7 @@ def main() -> None:
     if args.cuda_only:
         check_cuda()
     elif not args.identity_only:
-        check_imports(strict_extras=bool(args.fresh_pins))
+        check_imports(requirements=args.fresh_pins or REQUIREMENTS)
         if args.fresh_pins:
             check_fresh_pins(args.fresh_pins)
 

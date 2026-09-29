@@ -124,7 +124,7 @@ checkpoint保存发生在累计边界，记录完整可训练状态、optimizer/
 | `scripts/audit_csgo_aligned.py` | 全量split/token长度与按地图图像/target隔离抽查报告 |
 | `scripts/compare_aligned_checkpoints.py` | 比较两个受信smoke checkpoint的LoRA、optimizer、scheduler、RNG、进度与validation metadata |
 | `tests/test_aligned_{training,ddp,launcher,conversion}.py`及相关dataset/inference/loader测试 | 新旧边界与关键数值语义回归 |
-| `scripts/setup_csgo_seen10.sh` / `scripts/check_csgo_environment.py` / `requirements-csgo-seen10.txt` | 新服务器隔离环境安装、已有环境只读保护、CPU导入与显式CUDA小检查 |
+| `scripts/setup_csgo_seen10.sh` / `scripts/repair_csgo_environment.py` / `scripts/check_csgo_environment.py` / `requirements-csgo-seen10.txt` | 新服务器隔离安装、已有环境缺包修复与核心版本保护、完整直接依赖和关键接口CPU检查；保留显式只读检查入口 |
 | `scripts/download_csgo_seen10_assets.py` / `scripts/csgo_seen10_assets.json` | 固定官方revision、按profile获取组件、离线size/hash检查、HF snapshot环境变量输出 |
 | `csgo_runtime_paths.py`及`tests/test_csgo_{runtime_paths,environment,assets}.py` | 服务器路径/共享评测环境选择、无副作用检查与隔离回归 |
 
@@ -149,8 +149,8 @@ checkpoint保存发生在累计边界，记录完整可训练状态、optimizer/
 日常操作简化为主文档第4节的两组命令：环境准备、权重下载并设置当前终端模型路径。FLUX首次网页授权和服务器登录作为下载前提单独简述，已完成时跳过，不增加日常检查命令。脚本内部的必要校验不变，下面保留设计与验收记录，不作为额外的逐项操作清单。
 
 - 实验语义不变：两份CSGO YAML、训练/模型/数据核心、19500步和有效batch128、LoRA/LR、224/448、milestones与指标实现不改。仅入口解析服务器路径，保留旧命令。
-- 环境与模型资产分开准备；Linux fresh采用Python3.11/3.12与PyTorch2.7.1/torchvision0.22.1 cu128，直接依赖独立固定。已有可用环境只读保留；不同环境不宣称逐位等价，新机实际GPU运行尚待验收。
+- 环境与模型资产分开准备；Linux fresh采用Python3.11/3.12与PyTorch2.7.1/torchvision0.22.1 cu128，直接依赖独立固定。2026-09-28补齐`datasets`、`tensorboard`，显式声明`PyYAML`、`packaging`；环境命令可为已有环境补装缺包，保留已安装直接依赖及Torch/CUDA/Triton版本。修复预检pip解析，允许必要的非核心间接依赖调整，记录实际变化；`--check`仍只读。不同环境不宣称逐位等价，新机实际GPU运行尚待验收。
 - 官方资产按不可变revision及字节hash审计；aligned不下载Omni bundled语言模型或FLUX完整生成模型，legacy/all补齐原生pipeline。通过显式三个snapshot路径固定加载，既不移动旧权重，也不改共享HF refs/main。
 - 数据按CLI/env/config/兼容默认解析；评测优先所选共享评测器自己的venv，显式CLI仍最高优先级，不把训练venv用于指标兜底。只读print-paths可在缺依赖机器运行，正式执行按动作检查必需路径。
 - 不自动重写checkpoint/provenance。严格源码指纹覆盖的核心文件保持不变；数据/base路径变化仍可能使旧resume被拒绝。目标是新机从官方权重开新实验，不是静默解除旧实验恢复合同。
-- 验收包括路径优先级/含空格/无评测环境训练/非cwd、旧命令、多卡命令规划、mock安装幂等/现有目录保护、离线缺失/损坏资产拒绝及本机只读检查。真实fresh安装、目标GPU smoke、正式实验均由用户手动执行；这次不下载大权重、不抢占现有任务。
+- 验收包括路径优先级/含空格/无评测环境训练/非cwd、旧命令、多卡命令规划、mock安装幂等/现有目录保护、离线缺失/损坏资产拒绝及本机只读检查。2026-09-28增加训练/推理导入链依赖覆盖、关键接口探测、核心版本保护、隔离临时venv内真实pip缺包修复与重复执行测试。完整fresh安装、目标GPU smoke、正式实验均由用户手动执行；这次不下载大权重、不抢占现有任务。

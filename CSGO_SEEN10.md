@@ -117,7 +117,9 @@ legacy使用原生Accelerate checkpoint；其`late`在每次保存时更新，�
 bash scripts/setup_csgo_seen10.sh --env-only
 ```
 
-默认创建项目内独立 `.venv`，不下载权重；已有可用环境保留，不自动升级或降级。不要直接复制旧服务器的 `.venv`。新环境采用 Python3.11/3.12、PyTorch2.7.1 / torchvision0.22.1 cu128，其他直接依赖见 [requirements-csgo-seen10.txt](requirements-csgo-seen10.txt)。
+默认创建项目内独立 `.venv`，不下载权重；**已有环境也直接重跑此命令，自动补装缺失依赖**，包括训练导入所需的 `datasets`、legacy 日志所需的 `tensorboard` 及必要的间接依赖，无需逐个手动 `pip install`。远端请先同步最新版脚本和依赖清单；不要复制旧服务器的 `.venv`。
+
+新环境采用 Python3.11/3.12、PyTorch2.7.1 / torchvision0.22.1 cu128，完整直接依赖见 [requirements-csgo-seen10.txt](requirements-csgo-seen10.txt)。已有环境保留已安装的直接依赖及 PyTorch/CUDA/Triton 版本；补装前预检依赖解析，必要时仅调整非核心间接依赖，并保存修复记录。若必须替换受保护版本才能解决冲突，脚本会明确报错，不擅自替换。安装后自动检查导入及关键接口，依赖完整时重复执行不重装。
 
 ### 4.2 权重下载
 
@@ -138,7 +140,7 @@ source <(.venv/bin/python scripts/download_csgo_seen10_assets.py --print-env)
 
 ### 4.3 必要说明
 
-完成首次HF授权和登录后，日常准备仍只需上述两组主命令，不再要求逐项执行环境、资产、路径或CUDA检查命令；脚本自身的必要校验仍保留，出错时再按提示排查。
+完成首次HF授权和登录后，日常准备仍只需上述两组主命令：第一组安装或修复 Python 依赖，第二组下载或补齐官方权重并设置路径。不再要求逐项执行环境、资产、路径或CUDA检查命令；脚本自身的必要校验仍保留，出错时再按提示排查。
 
 新服务器目录不同时，通过以下环境变量指定；未设置时保留本机兼容默认，新机器可回退到项目同级的数据/评测器目录。
 
@@ -179,7 +181,7 @@ bash scripts/run_csgo_seen10.sh eval --seed 0 --task all
 # 单卡已通过真实模型smoke的组合；默认不传micro/accum时为1×128。
 NUM_PROCESSES=1 bash scripts/run_csgo_seen10.sh train \
   --experiment csgo_seen10_exp32gen_aligned --seed 42 \
-  --micro-batch-size 2 --gradient-accumulation-steps 64
+  --micro-batch-size 64 --gradient-accumulation-steps 2
 
 # 同一run、原执行配置恢复（有完整checkpoint后才使用）：
 NUM_PROCESSES=1 bash scripts/run_csgo_seen10.sh train \
@@ -188,9 +190,7 @@ NUM_PROCESSES=1 bash scripts/run_csgo_seen10.sh train \
   --resume-from-checkpoint latest
 
 # 多卡首次启动的互斥示例；需实际有4张可见GPU，未做真实多GPU验收：
-NUM_PROCESSES=4 bash scripts/run_csgo_seen10.sh train \
-  --experiment csgo_seen10_exp32gen_aligned --seed 42 \
-  --micro-batch-size 4 --gradient-accumulation-steps 8
+CUDA_VISIBLE_DEVICES=0,1 NUM_PROCESSES=2 nohup bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --seed 42 --micro-batch-size 64 --gradient-accumulation-steps 1 >omnigen2_aligned.nohup.out 2>&1 &
 ```
 
 可在aligned命令后加 `--dry-run`只打印实际命令、不写run目录。多个首次启动示例不能重复写入同一个run；有运行任务时不要再启动一个写同目录的进程。
@@ -366,3 +366,17 @@ aligned验收摘要（详见 [CSGO_ALIGNED_VALIDATION.md](CSGO_ALIGNED_VALIDATIO
 Qwen缺失项属于本次固定完整清单中的生成配置元数据，不代表18项已通过hash的文件损坏，也不推翻此前GPU smoke记录。用户可按第4节下载命令手动补齐，下载脚本会自动校验，无需再单独执行检查命令。未对legacy/all全部大权重另做完整hash验收，不把aligned结果泛化为legacy资产就绪。
 
 未实际执行新环境pip/Conda安装、远端服务器GPU检查、真实模型短训/推理或全量评测；没有停止已有ControlAR/OpenPI任务、改写checkpoint、覆盖预测或创建正式aligned run。新服务器日常准备按第4节两组命令执行；第7节保留独立smoke方法，供需要时验收，不计入环境准备步骤。正式启动由用户决定。
+
+### 8.2 环境缺包自动修复增补：2026-09-28
+
+远端双卡启动在公共训练数据集导入时缺少`datasets`，尚未进入训练；同时审计发现legacy默认TensorBoard也未列入新机依赖。此次将`datasets==4.0.0`、`tensorboard==2.21.0`补入清单，并显式固定`PyYAML==6.0.3`、`packaging==25.0`。第一组环境命令现可直接修复已有环境，不再要求逐包安装。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| 全部回归测试 | 114 passed、14 subtests passed，45.38秒；20项已有Torch弃用/可选FlashAttention警告，无失败 |
+| 依赖与修复覆盖 | 训练/推理/转换/下载入口的静态导入链与直接依赖清单匹配；缺包及关键接口检查、pip解析预检、核心版本保护、间接依赖/extra依赖检查、混合环境metadata优先级测试通过 |
+| 实际安装测试 | 独立临时venv中用离线小型wheel验证真实pip补装缺失直接/间接依赖、重复执行不重装、修复记录保留；不涉及大模型或项目`.venv`安装 |
+| 本机只读检查 | 正确拒绝缺少`opencv-python-headless`、`wandb`的现有环境，不再像第8.1节旧检查器那样仅警告后通过；未在本机实际补装 |
+| 脚本与隔离 | Bash语法、HF登录CLI入口、权重下载离线dry-run、`git diff --check`通过；CSGO配置、原requirements及严格训练源码指纹覆盖文件未改变 |
+
+仍按第4节两组命令执行；新增修复助手`scripts/repair_csgo_environment.py`由环境脚本内部调用，无需单独运行。每次成功修复将实际变化与包版本记录到所选环境的`csgo-repair-*-manifest.json`及对应`pip-freeze.txt`。权重下载继续复用并校验固定revision缓存，FLUX授权/登录要求不变。未在远端实装新版环境、下载大权重或启动训练/推理/评测；不把上述测试等同于双GPU训练通过。

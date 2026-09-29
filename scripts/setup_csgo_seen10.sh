@@ -5,6 +5,7 @@ export PYTHONDONTWRITEBYTECODE=1
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 REQUIREMENTS="$PROJECT_ROOT/requirements-csgo-seen10.txt"
 CHECKER="$PROJECT_ROOT/scripts/check_csgo_environment.py"
+REPAIR="$PROJECT_ROOT/scripts/repair_csgo_environment.py"
 ASSETS="$PROJECT_ROOT/scripts/download_csgo_seen10_assets.py"
 MODE=setup
 ENV_ONLY=0
@@ -16,8 +17,8 @@ Usage: bash scripts/setup_csgo_seen10.sh [--env-only] [--check | --check-cuda] [
 
 Default: use OmniGen2/.venv/bin/python. Create a missing isolated environment,
 install pinned dependencies, then verify/download the selected official model
-assets (default profile: all). Existing complete environments are only checked;
-their installed packages are never installed, upgraded, or downgraded.
+assets (default profile: all). Existing environments are repaired in place when
+dependencies are missing, preserving their installed core package versions.
 
 --env-only    Prepare/check only Python dependencies; skip all model assets.
 --check       Read-only CPU import check and, unless --env-only, asset check.
@@ -54,7 +55,7 @@ while (( $# )); do
     esac
 done
 case "$PROFILE" in aligned|legacy|all) ;; *) die "invalid --profile=$PROFILE" ;; esac
-[[ -f "$REQUIREMENTS" && -f "$CHECKER" ]] || die "missing environment files"
+[[ -f "$REQUIREMENTS" && -f "$CHECKER" && -f "$REPAIR" ]] || die "missing environment files"
 
 PYTHON="${OMNIGEN2_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
 [[ "$PYTHON" != '~/'* ]] || PYTHON="${HOME:?HOME is required for ~/ paths}/${PYTHON:2}"
@@ -89,9 +90,9 @@ fi
 if [[ -e "$ENV_DIR" || -L "$ENV_DIR" ]]; then
     [[ -d "$ENV_DIR" && -x "$PYTHON" ]] || die "$ENV_DIR exists but is not an environment; preserved unchanged"
     check_environment --identity-only
-    if ! check_environment; then
-        die "existing environment is incomplete; preserved unchanged. Use OMNIGEN2_PYTHON=$PROJECT_ROOT/.venv-csgo-seen10/bin/python to create a separate environment"
-    fi
+    "$PYTHON" "$REPAIR" --requirements "$REQUIREMENTS" --checker "$CHECKER" \
+        --expected-prefix "$ENV_DIR" --backend "${OMNIGEN2_TORCH_BACKEND:-cu128}"
+    check_environment
 else
     backend="${OMNIGEN2_TORCH_BACKEND:-cu128}"
     case "$backend" in cu128|cpu) ;; *) die "unsupported OMNIGEN2_TORCH_BACKEND=$backend; choose cu128 or cpu" ;; esac

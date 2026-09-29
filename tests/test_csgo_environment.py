@@ -12,6 +12,7 @@ import unittest
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "scripts" / "setup_csgo_seen10.sh"
+REPAIR = SOURCE.with_name("repair_csgo_environment.py")
 FAKE_PYTHON = """#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
@@ -38,6 +39,7 @@ class EnvironmentSetupTests(unittest.TestCase):
         scripts = self.project / "scripts"
         scripts.mkdir(parents=True)
         shutil.copy2(SOURCE, scripts / SOURCE.name)
+        shutil.copy2(REPAIR, scripts / REPAIR.name)
         (scripts / "check_csgo_environment.py").write_text("# mocked by fake Python\n")
         (scripts / "download_csgo_seen10_assets.py").write_text("# mocked by fake Python\n")
         (self.project / "requirements-csgo-seen10.txt").write_text("numpy==2.2.6\n")
@@ -85,7 +87,7 @@ class EnvironmentSetupTests(unittest.TestCase):
             result = self.invoke("--env-only")
             self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 6)
         self.assertTrue(all(call["exe"] == str(self.target_python) for call in calls))
         self.assertTrue(all("-m" not in call["args"] for call in calls))
         self.assertTrue(all("download_csgo_seen10_assets.py" not in " ".join(call["args"]) for call in calls))
@@ -131,8 +133,7 @@ class EnvironmentSetupTests(unittest.TestCase):
         sentinel.write_text("user data")
         result = self.invoke("--env-only", extra_env={"FAIL_CHECK": "1"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("preserved unchanged", result.stderr)
-        self.assertIn(".venv-csgo-seen10", result.stderr)
+        self.assertTrue(any("--expected-prefix" in c["args"] for c in self.calls()))
         self.assertEqual(sentinel.read_text(), "user data")
         self.assertFalse(any("-m" in c["args"] for c in self.calls()))
 

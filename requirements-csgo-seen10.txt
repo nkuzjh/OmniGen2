@@ -1,7 +1,8 @@
 # Fresh Linux NVIDIA CSGO environment. setup_csgo_seen10.sh installs the
 # matched torch/torchvision wheel pair first from the official cu128 index;
 # these pins also prevent a later dependency resolution from replacing it.
-# Existing environments are checked in place and are never reconciled to pins.
+# Existing environments retain installed direct/core versions; the setup script
+# installs missing requirements and resolves their non-core dependencies.
 torch==2.7.1
 torchvision==0.22.1
 numpy==2.2.6
@@ -13,13 +14,17 @@ transformers==4.51.3
 diffusers==0.35.2
 peft==0.17.1
 huggingface-hub==0.36.2
+datasets==4.0.0
 tokenizers==0.21.4
 safetensors==0.5.3
 omegaconf==2.3.0
+PyYAML==6.0.3
+packaging==25.0
 opencv-python-headless==4.11.0.86
 scipy==1.16.3
 torchdiffeq==0.2.5
 wandb==0.22.2
+tensorboard==2.21.0
 matplotlib==3.10.7
 tqdm==4.67.1
 python-dotenv==1.1.1
