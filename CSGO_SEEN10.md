@@ -191,6 +191,8 @@ NUM_PROCESSES=1 bash scripts/run_csgo_seen10.sh train \
 
 # 多卡首次启动的互斥示例；需实际有4张可见GPU，未做真实多GPU验收：
 CUDA_VISIBLE_DEVICES=0,1 NUM_PROCESSES=2 nohup bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --seed 42 --micro-batch-size 64 --gradient-accumulation-steps 1 >omnigen2_aligned.nohup.out 2>&1 &
+
+CUDA_VISIBLE_DEVICES=0,1 NUM_PROCESSES=2 nohup bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --seed 42 --micro-batch-size 64 --gradient-accumulation-steps 1 --resume-from-checkpoint latest >omnigen2_aligned.nohup.out1 2>&1 &
 ```
 
 可在aligned命令后加 `--dry-run`只打印实际命令、不写run目录。多个首次启动示例不能重复写入同一个run；有运行任务时不要再启动一个写同目录的进程。
