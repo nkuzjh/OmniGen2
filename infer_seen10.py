@@ -11,7 +11,7 @@ import re
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from csgo_runtime_paths import data_root as select_data_root
 
@@ -484,6 +484,57 @@ def _dataset_hashes(
     return protocol_hashes, radar_hashes
 
 
+def _validate_aligned_contract_files(contract_files: Any, data_root: Path) -> None:
+    """Verify every training file by relative path after a data-root move."""
+    from omnigen2.dataset.csgo_seen10_dataset import SEEN_MAPS
+
+    if not isinstance(contract_files, Mapping):
+        raise ValueError("Aligned adapter is missing protocol file hashes")
+    required = {
+        "benchmark_manifest.json",
+        "minimal_dataset_report.json",
+        "calibration/z_calibration.json",
+    }
+    required.update(
+        f"splits/seen/{map_name}/{split_name}"
+        for map_name in SEEN_MAPS
+        for split_name in ("train.json", "validation.json")
+    )
+    resolved_root = data_root.resolve()
+    resolved_paths = {}
+    for relative, expected_hash in contract_files.items():
+        if (
+            not isinstance(relative, str)
+            or Path(relative).is_absolute()
+            or PureWindowsPath(relative).drive
+            or "\\" in relative
+            or any(part in ("", ".", "..") for part in relative.split("/"))
+        ):
+            raise ValueError(f"Unsafe aligned contract file path: {relative!r}")
+        if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+            raise ValueError(f"Invalid aligned contract file hash: {relative}")
+        path = (resolved_root / relative).resolve()
+        try:
+            path.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ValueError(f"Aligned contract file escapes data root: {relative}") from exc
+        resolved_paths[relative] = path
+
+    if set(contract_files) != required:
+        missing = sorted(required - contract_files.keys())
+        unexpected = sorted(repr(key) for key in contract_files.keys() - required)
+        raise ValueError(
+            f"Aligned adapter contract file keys differ from required Seen-10 files: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    for relative, path in resolved_paths.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"Aligned contract file missing: {path}")
+        if _sha256_file(path) != contract_files[relative]:
+            raise ValueError(f"Aligned inference protocol asset differs from training: {relative}")
+
+
 def _checkpoint_provenance(
     model_path_value: str, adapter_path_value: str, experiment: str = LEGACY_EXPERIMENT,
     model_revision: str | None = None,
@@ -678,11 +729,8 @@ def _make_task_plan(
     protocol_hashes, radar_hashes = _dataset_hashes(dataset, data_root, task, map_order)
     if aligned:
         contract = checkpoint["aligned_adapter"]["contract_identity"]
-        if Path(contract.get("data_root", "")).resolve() != data_root:
-            raise ValueError("Aligned inference data root differs from the training contract")
         contract_files = contract.get("contract_files")
-        if not isinstance(contract_files, Mapping):
-            raise ValueError("Aligned adapter is missing protocol file hashes")
+        _validate_aligned_contract_files(contract_files, data_root)
         for relative in (
             "benchmark_manifest.json", "minimal_dataset_report.json",
             "calibration/z_calibration.json",

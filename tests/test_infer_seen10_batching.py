@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ import torch
 from PIL import Image
 
 import infer_seen10
+from omnigen2.dataset.csgo_seen10_dataset import SEEN_MAPS
 
 
 def _identities(count):
@@ -49,6 +51,158 @@ class RecordingPipeline:
         return SimpleNamespace(
             images=[Image.new("RGB", (448, 448), (index, 0, 0)) for index, _ in enumerate(kwargs["prompt"])]
         )
+
+
+class TestAlignedContractPortability(unittest.TestCase):
+    @staticmethod
+    def _contract_files(root, maps):
+        relatives = [
+            "benchmark_manifest.json",
+            "minimal_dataset_report.json",
+            "calibration/z_calibration.json",
+        ]
+        relatives.extend(
+            f"splits/seen/{map_name}/{split_name}"
+            for map_name in maps
+            for split_name in ("train.json", "validation.json")
+        )
+        hashes = {}
+        for relative in relatives:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = relative.encode("utf-8")
+            path.write_bytes(content)
+            hashes[relative] = hashlib.sha256(content).hexdigest()
+        return hashes
+
+    @staticmethod
+    def _task_plan(data_root, checkpoint, experiment, protocol_hashes):
+        class Dataset:
+            load_target = False
+            rows = [{"map_name": "cs_agency", "file_frame": "file_num1_frame_0000"}]
+
+            def __init__(self, **_options):
+                pass
+
+            def __len__(self):
+                return len(self.rows)
+
+        args = SimpleNamespace(
+            data_root=str(data_root), experiment=experiment, max_samples=None,
+            seed=0, num_inference_steps=28, dtype="bf16", offload=False,
+        )
+        with patch.object(infer_seen10, "_dataset_hashes", return_value=(protocol_hashes, {})):
+            return infer_seen10._make_task_plan(
+                "discrete", Dataset, ("cs_agency",), args,
+                data_root / "outputs", checkpoint,
+            )
+
+    def test_cross_server_root_accepts_all_23_identical_contract_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local_root = Path(directory) / "local" / "csgo_benchmark_v2"
+            hashes = self._contract_files(local_root, SEEN_MAPS)
+            self.assertEqual(len(hashes), 23)
+            training_root = "/remote/server/csgo_benchmark_v2"
+            contract = {"data_root": training_root, "contract_files": hashes}
+            checkpoint = {"aligned_adapter": {"contract_identity": contract}}
+            plan = self._task_plan(
+                local_root, checkpoint, infer_seen10.ALIGNED_EXPERIMENT, hashes,
+            )
+            self.assertEqual(plan.base_manifest["data_root"], str(local_root.resolve()))
+            self.assertEqual(
+                plan.base_manifest["checkpoint"]["aligned_adapter"]["contract_identity"],
+                contract,
+            )
+
+    def test_changed_training_file_fails_on_same_and_moved_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for location in ("training", "moved"):
+                data_root = root / location
+                hashes = self._contract_files(data_root, SEEN_MAPS)
+                changed = data_root / "splits/seen/cs_agency/validation.json"
+                changed.write_bytes(b"changed validation samples")
+                contract = {
+                    "data_root": str(root / "training"),
+                    "contract_files": hashes,
+                }
+                with self.subTest(location=location), self.assertRaisesRegex(
+                    ValueError, "validation.json"
+                ):
+                    self._task_plan(
+                        data_root, {"aligned_adapter": {"contract_identity": contract}},
+                        infer_seen10.ALIGNED_EXPERIMENT, hashes,
+                    )
+
+    def test_unsafe_absolute_traversal_and_symlink_escape_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root = root / "data"
+            hashes = self._contract_files(data_root, SEEN_MAPS)
+            outside = root / "outside.json"
+            outside.write_bytes(b"outside")
+            (data_root / "escape.json").symlink_to(outside)
+            for relative, message in (
+                (str(outside), "Unsafe aligned contract file path"),
+                ("C:/outside.json", "Unsafe aligned contract file path"),
+                ("../outside.json", "Unsafe aligned contract file path"),
+                ("escape.json", "escapes data root"),
+            ):
+                with self.subTest(relative=relative), self.assertRaisesRegex(ValueError, message):
+                    infer_seen10._validate_aligned_contract_files(
+                        {**hashes, relative: hashlib.sha256(b"outside").hexdigest()}, data_root,
+                    )
+
+    def test_missing_required_protocol_hash_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory)
+            hashes = self._contract_files(data_root, SEEN_MAPS)
+            del hashes["benchmark_manifest.json"]
+            with self.assertRaisesRegex(ValueError, "contract file keys differ.*benchmark_manifest.json"):
+                infer_seen10._validate_aligned_contract_files(hashes, data_root)
+
+    def test_missing_training_split_hash_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory)
+            hashes = self._contract_files(data_root, SEEN_MAPS)
+            del hashes["splits/seen/de_nuke/validation.json"]
+            with self.assertRaisesRegex(ValueError, "de_nuke/validation.json"):
+                infer_seen10._validate_aligned_contract_files(hashes, data_root)
+
+    def test_empty_contract_file_mapping_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "contract file keys differ"):
+                infer_seen10._validate_aligned_contract_files({}, Path(directory))
+
+    def test_extra_target_file_key_is_rejected_without_reading_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory)
+            hashes = self._contract_files(data_root, SEEN_MAPS)
+            target = data_root / "images/cs_agency/file_num1_frame_0000.jpg"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"private target")
+            hashes[target.relative_to(data_root).as_posix()] = hashlib.sha256(b"private target").hexdigest()
+            with (
+                patch.object(infer_seen10, "_sha256_file", side_effect=AssertionError("read file")),
+                self.assertRaisesRegex(ValueError, "unexpected=.*images/cs_agency"),
+            ):
+                infer_seen10._validate_aligned_contract_files(hashes, data_root)
+
+    def test_missing_contract_file_metadata_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory)
+            checkpoint = {"aligned_adapter": {"contract_identity": {"data_root": str(data_root)}}}
+            with self.assertRaisesRegex(ValueError, "missing protocol file hashes"):
+                self._task_plan(
+                    data_root, checkpoint, infer_seen10.ALIGNED_EXPERIMENT, {},
+                )
+
+    def test_legacy_plan_does_not_require_aligned_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory)
+            plan = self._task_plan(data_root, {}, infer_seen10.LEGACY_EXPERIMENT, {})
+            self.assertEqual(plan.base_manifest["data_root"], str(data_root.resolve()))
+            self.assertNotIn("experiment", plan.base_manifest)
 
 
 class TestSeen10BatchedInference(unittest.TestCase):

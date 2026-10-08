@@ -192,7 +192,7 @@ NUM_PROCESSES=1 bash scripts/run_csgo_seen10.sh train \
 # 多卡首次启动的互斥示例；需实际有4张可见GPU，未做真实多GPU验收：
 CUDA_VISIBLE_DEVICES=0,1 NUM_PROCESSES=2 nohup bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --seed 42 --micro-batch-size 64 --gradient-accumulation-steps 1 >omnigen2_aligned.nohup.out 2>&1 &
 
-CUDA_VISIBLE_DEVICES=0,1 NUM_PROCESSES=2 nohup bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --seed 42 --micro-batch-size 64 --gradient-accumulation-steps 1 --resume-from-checkpoint latest >omnigen2_aligned.nohup.out1 2>&1 &
+CUDA_VISIBLE_DEVICES=1,2 NUM_PROCESSES=2 nohup bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --seed 42 --micro-batch-size 64 --gradient-accumulation-steps 1 --resume-from-checkpoint latest >>omnigen2_aligned.nohup.out1 2>&1 &
 ```
 
 可在aligned命令后加 `--dry-run`只打印实际命令、不写run目录。多个首次启动示例不能重复写入同一个run；有运行任务时不要再启动一个写同目录的进程。
@@ -200,24 +200,26 @@ CUDA_VISIBLE_DEVICES=0,1 NUM_PROCESSES=2 nohup bash scripts/run_csgo_seen10.sh t
 ```bash
 # 主结果：训练结束的同一个late用于discrete和continuous。
 bash scripts/run_csgo_seen10.sh convert \
-  --experiment csgo_seen10_exp32gen_aligned --seed 42 --checkpoint late
+  --experiment csgo_seen10_exp32gen_aligned --seed 42 --checkpoint late && \
 bash scripts/run_csgo_seen10.sh infer \
   --experiment csgo_seen10_exp32gen_aligned --seed 42 --inference-seed 42 \
-  --checkpoint late --task all --batch-size 16 --vae-decode-batch-size 1
+  --checkpoint late --task all --batch-size 16 --vae-decode-batch-size 1 && \
 bash scripts/run_csgo_seen10.sh eval \
   --experiment csgo_seen10_exp32gen_aligned --seed 42 --checkpoint late --task all
 
 # 补充结果：独立best预测/评测目录。
 bash scripts/run_csgo_seen10.sh convert \
-  --experiment csgo_seen10_exp32gen_aligned --seed 42 --checkpoint best
+  --experiment csgo_seen10_exp32gen_aligned --seed 42 --checkpoint best && \
 bash scripts/run_csgo_seen10.sh infer \
   --experiment csgo_seen10_exp32gen_aligned --seed 42 --inference-seed 42 \
-  --checkpoint best --task all --batch-size 16 --vae-decode-batch-size 1
+  --checkpoint best --task all --batch-size 16 --vae-decode-batch-size 1 && \
 bash scripts/run_csgo_seen10.sh eval \
   --experiment csgo_seen10_exp32gen_aligned --seed 42 --checkpoint best --task all
 ```
 
 分任务时用 `--task discrete`或`--task continuous`，保持checkpoint和inference seed相同。`--seed`选择训练run，`--inference-seed`默认42；当前输出路径**不含inference seed子目录**，不能更改seed后复用同一目录。
+
+远程训练完成后同步至本地，沿用以上命令即可；保持checkpoint和adapter的metadata原样。推理允许数据目录的绝对路径改变，但会逐项校验训练合同记录的全部协议、calibration及train/validation split文件SHA256，并继续检查测试split的发布协议及基础权重的固定revision。推理manifest记录本地数据路径、测试split/radar资产SHA256并保留原始训练合同；测试split/radar的这些SHA256用于追溯和输出恢复校验，不是与训练合同中的expected hash比对。模型权重仍需在本机缓存中可用，准备方式见第4节。命令间的`&&`使转换或推理失败时不继续评测。
 
 ### 推理加速设置
 
@@ -382,3 +384,13 @@ Qwen缺失项属于本次固定完整清单中的生成配置元数据，不代�
 | 脚本与隔离 | Bash语法、HF登录CLI入口、权重下载离线dry-run、`git diff --check`通过；CSGO配置、原requirements及严格训练源码指纹覆盖文件未改变 |
 
 仍按第4节两组命令执行；新增修复助手`scripts/repair_csgo_environment.py`由环境脚本内部调用，无需单独运行。每次成功修复将实际变化与包版本记录到所选环境的`csgo-repair-*-manifest.json`及对应`pip-freeze.txt`。权重下载继续复用并校验固定revision缓存，FLUX授权/登录要求不变。未在远端实装新版环境、下载大权重或启动训练/推理/评测；不把上述测试等同于双GPU训练通过。
+
+### 8.3 远程训练同步与本地推理修复：2026-10-07
+
+用户已在远程完成训练并同步至本地。此次只读核对`seed_42/train`的五个checkpoint均有`COMPLETE`，metadata记录`world_size=2`、micro64、累计1、有效batch128，最终step19500；`best`、`late`、`latest`均指向`checkpoint-19500`，该点的validation loss在五份metadata中最低。`adapters/late`转换成功，原始训练合同与checkpoint一致、指纹有效。上述是同步产物的核对，不是本轮重新训练。
+
+此前推理错误由远程`/home/user/yc57963/task/UniLIP/data/csgo_benchmark_v2`与本地`/home/jiahao/task/UniLIP/data/csgo_benchmark_v2`绝对路径不同触发；23个合同文件的本地SHA256实际全部一致。现将推理守卫改为完整合同文件内容比对，保留原始合同和基础revision检查；不改checkpoint、adapter、训练代码或采样参数。第5节命令增加`&&`，避免推理失败后继续评测空预测目录。
+
+真实数据只读预检通过：离散20000条、连续12800条（200 clips），每集10地图；每地图首末样本共40条条件输入检查通过，radar224×224 RGB，`load_target=False`，仅打开10张radar、未打开目标FPV。三个官方基础revision均可离线解析。未创建正式预测目录或启动全量推理/评测，本地Show-o训练保持运行；正式推理由用户按第5节命令手动执行。
+
+回归验收：`tests.test_infer_seen10_batching`的24项CPU测试通过（含9项迁移、内容变更、缺项、不安全路径、额外target键禁读及legacy兼容测试）；转换和运行路径的12项测试、6项子测试通过。原推理/评测命令dry-run和`git diff --check`通过。此验收覆盖本次数据守卫修复，不等同于正式batch16生成或全量评测完成。
